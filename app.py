@@ -25,12 +25,19 @@ st.markdown("""
 # -----------------------
 # OpenAI API 연결
 # -----------------------
-try:
-    client = OpenAI(api_key=st.secrets["general"]["OPENAI_API_KEY"])
-except Exception:
-    st.error("⚠️ OPENAI_API_KEY 설정 필요")
-    st.stop()
-MODEL_NAME = "gpt-4o"
+import os
+import streamlit as st
+from openai import OpenAI
+
+# ✅ 환경 변수 또는 Streamlit secrets 둘 다 지원
+api_key = os.environ.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
+
+if not api_key:
+    st.error("⚠️ OPENAI_API_KEY가 설정되지 않았습니다. Render 환경변수를 확인하세요.")
+else:
+    client = OpenAI(api_key=api_key)
+
+MODEL_NAME = "gpt-5"
 
 # -----------------------
 # JSON 유틸
