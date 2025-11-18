@@ -30,7 +30,7 @@ def save_json(path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 ###########################################################
-# 수동 가능자 (변경되면 여기 수정)
+# 수동 가능자 설정
 ###########################################################
 MANUAL_SET = {
     "권한솔","김남균","김성연",
@@ -48,9 +48,7 @@ def extract_staff(text):
     for name in m:
         staff.append(name.strip())
 
-    # 1종자동 = 감독관 미기재 → 패스
-
-    # 2종자동 (• 숫자호 이름)
+    # 2종자동
     m2 = re.findall(r"•\s*[\d]+호\s*([가-힣]+)", text)
     for name in m2:
         staff.append(name.strip())
@@ -59,13 +57,11 @@ def extract_staff(text):
 
 
 def extract_extra(text):
-    # 교양
     edu = {}
     m = re.findall(r"(\d)교시\s*:\s*([가-힣]+)", text)
     for gyo, name in m:
         edu[int(gyo)] = name.strip()
 
-    # 코스점검
     course = []
     m2 = re.findall(r"코스점검\s*:\s*(.*)", text)
     if m2:
@@ -122,20 +118,20 @@ def apply_weights(staff_list, period, is_morning):
     for s in staff_list:
         weight = 0
 
-        # 코스 (1교시)
+        # 코스 1교시
         if is_morning and period == 1 and s.is_course:
             weight += 1
 
-        # 코스 연장 (2교시)
+        # 코스 연장 2교시
         if is_morning and period == 2 and s.need_low_next:
             weight += 1
 
-        # 교양: k교시 담당자 → (k-1)교시 적용
-        for k in [2,4,5]:       # 1,3교시는 제외
+        # 교양: k교시 → 전 교시 적용 (1,3 제외)
+        for k in [2,4,5]:
             if period == k-1 and s.is_edu[k]:
                 weight += 1
 
-        # 중복 제한: 1
+        # 중복 제한
         if weight > 1:
             weight = 1
 
@@ -167,6 +163,7 @@ def pick_random_idx(staff_list, idx_list, period, type_code, hist):
 # 한 교시 배정
 ###########################################################
 def assign_one_period(staff_list, period, demand, is_morning):
+    # 전교시 미배정 보정
     for s in staff_list:
         if s.assigned["prev_zero"]:
             s.load += 1
@@ -208,15 +205,12 @@ def assign_one_period(staff_list, period, demand, is_morning):
             if not candidates:
                 continue
 
-            if len(candidates) == 1:
-                pick = candidates[0]
-            else:
-                pick = pick_random_idx(staff_list, candidates, period, type_code, hist)
+            pick = candidates[0] if len(candidates)==1 else pick_random_idx(staff_list, candidates, period, type_code, hist)
 
             assigned[staff_list[pick].name][type_code] += 1
             total[pick] += 1
 
-    # 공평성 재조정
+    # 공평성 보정
     def mix(i):
         info = assigned[staff_list[i].name]
         c = sum(1 for v in info.values() if v>0)
@@ -241,10 +235,11 @@ def assign_one_period(staff_list, period, demand, is_morning):
                 total[idx_min] += 1
                 moved = True
                 break
+
         if not moved:
             break
 
-    # load/prev_zero/코스연장 판단
+    # Load/prev_zero/코스연장 갱신
     for i,s in enumerate(staff_list):
         s.load += total[i]
         s.assigned["prev_zero"] = (total[i]==0)
@@ -293,7 +288,7 @@ with tab_m:
     if "m_staff_raw" in st.session_state:
         st.subheader("✏ 근무자 수정 (추가/삭제/변경 가능)")
         df = pd.DataFrame({"근무자": st.session_state["m_staff_raw"]})
-        edited = st.experimental_data_editor(df, num_rows="dynamic", key="m_edit")
+        edited = st.data_editor(df, num_rows="dynamic", key="m_edit")
         final_staff_names = edited["근무자"].dropna().tolist()
 
         st.session_state["m_staff_final"] = final_staff_names
@@ -362,7 +357,7 @@ with tab_a:
     if "a_staff_raw" in st.session_state:
         st.subheader("✏ 근무자 수정 (추가/삭제/변경 가능)")
         df = pd.DataFrame({"근무자": st.session_state["a_staff_raw"]})
-        edited = st.experimental_data_editor(df, num_rows="dynamic", key="a_edit")
+        edited = st.data_editor(df, num_rows="dynamic", key="a_edit")
         final_staff_names = edited["근무자"].dropna().tolist()
 
         st.session_state["a_staff_final"] = final_staff_names
@@ -408,7 +403,7 @@ with tab_a:
 # 랜덤 히스토리 탭
 ############################################################
 with tab_r:
-    st.subheader("🎲 최근 3일 랜덤 배정 히스토리")
+    st.subheader("🎲 최근 랜덤 배정 히스토리")
     hist = load_history()
     if not hist:
         st.info("랜덤 기록 없음")
