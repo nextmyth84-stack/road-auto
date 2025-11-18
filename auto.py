@@ -92,10 +92,42 @@ class Staff:
 # "랜덤결과" 리스트 (이제: 적게 배정된 사람 이름 리스트, 다음 교시 우선 배정용)
 ###########################################################
 def load_history():
-    # 이름 리스트로 사용
-    return load_json(HISTORY_FILE, [])
+    """
+    random_history.json 포맷 마이그레이션 처리:
+    - 예전 버전: [{"date":..., "name":..., "period":..., "type":...}, ...]
+    - 지금 버전: ["김성연", "조정래", ...]
+    """
+    data = load_json(HISTORY_FILE, [])
+
+    # 리스트가 아니면 그냥 빈 리스트로
+    if not isinstance(data, list):
+        return []
+
+    # 빈 리스트면 그대로
+    if not data:
+        return []
+
+    # 예전 형식: 리스트 안에 dict가 들어있는 경우 → name만 추출
+    if isinstance(data[0], dict):
+        names = []
+        for item in data:
+            if isinstance(item, dict) and "name" in item:
+                nm = item["name"]
+                if isinstance(nm, str) and nm not in names:
+                    names.append(nm)
+        # 새 포맷으로 덮어쓰기
+        save_history(names)
+        return names
+
+    # 새 형식(이름 문자열 리스트)이라고 가정
+    cleaned = []
+    for v in data:
+        if isinstance(v, str) and v not in cleaned:
+            cleaned.append(v)
+    return cleaned
 
 def save_history(d):
+    # d는 이름 문자열 리스트
     save_json(HISTORY_FILE, d)
 
 def reset_history():
