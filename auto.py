@@ -1,17 +1,22 @@
 ###############################################
-# 도로주행 자동 배정 vFinal (Fix: 에러 수정 및 안정화)
+# 🚗 도로주행 자동 배정 (오전/오후 분리 + 하루 총합 우선 + 랜덤 Fallback)
+# - 오전/오후 가중치는 완전 분리
+# - 하루 총합(total_history)은 오전·오후 공통 사용
+# - 오후 신규 근무자는 오전 total의 "평균값"으로 시작
+# - 배정 우선순위: 하루 총합 → 가중치(코스/교양) → 랜덤
+# - 랜덤 히스토리는 오전·오후 공용 (오늘 중복 랜덤 방지 용도)
 ###############################################
 import streamlit as st
 import json, os, re, random
 import pandas as pd
-from datetime import date
-from collections import defaultdict
 
 st.set_page_config(page_title="도로주행 자동 배정", layout="wide")
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
-HISTORY_FILE = os.path.join(DATA_DIR, "random_history.json")
+
+RANDOM_HISTORY_FILE = os.path.join(DATA_DIR, "random_history.json")
+TOTAL_HISTORY_FILE = os.path.join(DATA_DIR, "total_history.json")
 
 ###########################################################
 # JSON Load / Save
@@ -29,397 +34,526 @@ def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def reset_history():
-    save_json(HISTORY_FILE, [])
+###########################################################
+# 히스토리 관리
+###########################################################
+def load_random_history():
+    # 랜덤으로 "혜택 받은 사람" 이름 리스트
+    return load_json(RANDOM_HISTORY_FILE, [])
+
+def save_random_history(names_list):
+    save_json(RANDOM_HISTORY_FILE, names_list)
+
+def reset_random_history():
+    save_json(RANDOM_HISTORY_FILE, [])
+
+def load_total_history():
+    # 하루 총합 배정 수: {이름: 배정횟수}
+    return load_json(TOTAL_HISTORY_FILE, {})
+
+def save_total_history(total_dict):
+    save_json(TOTAL_HISTORY_FILE, total_dict)
+
+def reset_total_history():
+    save_json(TOTAL_HISTORY_FILE, {})
 
 ###########################################################
 # 수동 가능자 설정
 ###########################################################
 MANUAL_SET = {
-    "권한솔","김남균","김성연",
-    "김주현","이호석","조정래"
+    "권한솔", "김남균", "김성연",
+    "김주현", "이호석", "조정래"
 }
 
 ###########################################################
-# 텍스트 파싱
+# 텍스트 파싱 (1종수동 + 2종자동 감독관 추출)
 ###########################################################
-def extract_staff(text):
+def extract_staff(text: str):
+    """
+    오전/오후 텍스트에서 도로주행 감독관 이름만 추출
+    - 1종수동: "1종수동: 9호 김주현"
+    - 2종자동: "• 6호 김지은"
+    열쇠, 1종자동(이름 없는 차량호수) 등은 무시
+    """
     staff = []
-    # Regex 수정: 다양한 공백 패턴 대응
-    m = re.findall(r"1종수동\s*[:;]?\s*\d+호\s*([가-힣]+)", text)
-    staff += [n.strip() for n in m]
-    m2 = re.findall(r"•\s*\d+호\s*([가-힣]+)", text)
+
+    # 1종수동 감독관
+    m1 = re.findall(r"1종수동\s*:\s*[\d]+호\s*([가-힣]+)", text)
+    staff += [n.strip() for n in m1]
+
+    # 2종자동 감독관
+    m2 = re.findall(r"•\s*[\d]+호\s*([가-힣]+)", text)
     staff += [n.strip() for n in m2]
+
+    # 중복 제거(순서 유지)
     return list(dict.fromkeys(staff))
 
-def extract_extra(text):
-    edu = {}
-    m = re.findall(r"(\d)교시\s*[:;]?\s*([가-힣]+)", text)
-    for gyo, name in m:
-        edu[int(gyo)] = name.strip()
-    
-    course = []
-    # 코스점검 파싱 로직 보완
-    body = re.findall(r"코스점검\s*[:;]?\s*(.*)", text)
-    if body:
-        # A코스 : 홍길동 패턴
-        mm = re.findall(r"[A-Z]코스.*?\s*([가-힣]+)", body[0])
-        course = [x.strip() for x in mm]
-    return edu, course
-
 ###########################################################
-# Staff Class
+# Staff 클래스
 ###########################################################
 class Staff:
-    def __init__(self, name):
+    def __init__(self, name: str):
         self.name = name
-        self.is_manual = (name in MANUAL_SET)
-        self.is_course = False
-        self.is_edu = {i:False for i in range(1,6)}
-        self.load = 0
-        self.need_low_next = False
-        self.assigned = {"prev_zero": False}
+        self.is_manual = (name in MANUAL_SET)  # 수동 가능자 여부
+        self.is_course = False                 # 코스 담당자(오전만)
+        self.is_edu = False                    # 해당 교시 교양 담당자
 
-###########################################################
-# 가중치 (중복시 최대 1)
-###########################################################
-def apply_weights(staff_list, period, is_morning):
-    for s in staff_list:
-        weight = 0
-        if is_morning and period == 1 and s.is_course:
-            weight += 1
-        if is_morning and period == 2 and s.need_low_next:
-            weight += 1
-        # 직전 교시 교육 여부 체크 (현재 로직상 단일 교시 배정이므로 완벽하진 않음)
-        for k in [2,4,5]:
-            if period == k-1 and s.is_edu.get(k, False):
-                weight += 1
-        
-        if weight > 1:
-            weight = 1
-        s.load += weight
+        # 이 파일에서의 load는 "이 교시"에서만 사용하는 가중치
+        self.load = 0.0
 
 ###########################################################
 # 자격 체크
 ###########################################################
-def is_eligible(st_obj, type_code):
-    if st_obj.is_manual:
+def is_eligible(staff: Staff, type_code: str) -> bool:
+    """
+    - 수동 가능자는 4종 모두 가능: 1M, 1A, 2A, 2M
+    - 그 외 자동 전용: 1A, 2A만 가능
+    """
+    if staff.is_manual:
         return True
-    return type_code in ("1A","2A")
+    return type_code in ("1A", "2A")
 
 ###########################################################
-# 한 교시 배정 (B안 공평성)
+# 가중치 계산 (코스/교양, 최대 1)
 ###########################################################
-def assign_one_period(staff_list, period, demand, is_morning):
-    # 이전 배정 정보 초기화 (단일 실행 시)
+def apply_session_weights(staff_list, is_morning: bool):
+    """
+    - 오전: 코스 담당 + 해당 교시 교양 담당
+    - 오후: 해당 교시 교양 담당만
+    - 코스 + 교양 중복이면 최대 1만 적용
+    결과는 s.load에 반영
+    """
     for s in staff_list:
-        if s.assigned.get("prev_zero", False):
-            s.load += 1
-        s.assigned["prev_zero"] = False
+        w = 0.0
+        if is_morning and s.is_course:
+            w += 1.0
+        if s.is_edu:
+            w += 1.0
+        if w > 1.0:
+            w = 1.0
+        s.load = w
 
-    apply_weights(staff_list, period, is_morning)
-    
-    # 인원별 상한선 설정
-    base_cap = 2 if period in (1,5) else 3
+###########################################################
+# 한 교시 배정 (하루 총합 우선 + 가중치 + 랜덤 Fallback)
+###########################################################
+def assign_one_period(staff_list, period: int, demand: dict,
+                      is_morning: bool, session_key: str):
+    """
+    staff_list : 이 교시의 감독관 리스트(Staff)
+    demand     : {"1M": x, "1A": y, "2A": z, "2M": w}
+    is_morning : 오전 여부 (코스 가중치에만 사용)
+    session_key: "morning" 또는 "afternoon" (UI 키 구분용 아님, 의미만)
+
+    우선순위:
+    1) 하루 총합(total_history) 적게 받은 사람
+    2) 현재 교시 가중치(load) 낮은 사람(코스/교양 적용)
+    3) 그래도 동점이면 랜덤 (이미 랜덤 혜택받은 이름은 최대한 제외)
+    """
+
+    # -------------------------
+    # 0. 기본 설정
+    # -------------------------
     n = len(staff_list)
-    
-    # 결과 저장소
-    assigned = {s.name: {"1M":0,"1A":0,"2A":0,"2M":0} for s in staff_list}
-    total = [0]*n
+    result = {s.name: {"1M": 0, "1A": 0, "2A": 0, "2M": 0} for s in staff_list}
+    if n == 0:
+        return result, [0] * 0  # 빈 배열
 
-    # 랜덤 기록 로드
-    hist = set(load_json(HISTORY_FILE, []))
-    
-    # 배정 순서
-    order = [("1M", demand.get("1M",0)),("1A", demand.get("1A",0)),
-             ("2A", demand.get("2A",0)),("2M", demand.get("2M",0))]
+    # 1,5교시: 최대 2명, 그 외: 최대 3명
+    base_cap = 2 if period in (1, 5) else 3
+
+    # 하루 총합 로드
+    total_history = load_total_history()
+    random_history = load_random_history()
+    rh_set = set(random_history)
+
+    # -------------------------
+    # 1. 이 교시에서 사용할 "하루 총합" 초기값 세팅
+    #    - 오전: 없으면 0부터
+    #    - 오후: 없으면 오전 total 평균값으로 시작(B안)
+    # -------------------------
+    # 우선 현재까지의 total 목록만 떼서 평균 계산
+    existing_totals = list(total_history.values())
+    avg_total = 0
+    if existing_totals:
+        avg_total = round(sum(existing_totals) / len(existing_totals))
+
+    # 이 교시에서 사용하는 day_total은 total_history를 복사해서 시작
+    day_total = {}
+    for s in staff_list:
+        if s.name in total_history:
+            day_total[s.name] = total_history[s.name]
+        else:
+            if is_morning:
+                # 오전 신규 → 아직 하루 첫 등장 → 0부터 시작
+                day_total[s.name] = 0
+            else:
+                # 오후 신규 → 오전 total의 "평균값"에서 시작
+                day_total[s.name] = avg_total
+
+    # -------------------------
+    # 2. 코스/교양 가중치 계산
+    # -------------------------
+    apply_session_weights(staff_list, is_morning=is_morning)
+    # 배열로 관리 편하게
+    name_list = [s.name for s in staff_list]
+    load_list = [s.load for s in staff_list]
+    assigned_period = [0] * n  # 이 교시에서 배정 수
+
+    # -------------------------
+    # 3. 종별별로 배정
+    # -------------------------
+    order = [
+        ("1M", demand.get("1M", 0)),
+        ("1A", demand.get("1A", 0)),
+        ("2A", demand.get("2A", 0)),
+        ("2M", demand.get("2M", 0)),
+    ]
 
     for type_code, need in order:
-        for _ in range(int(need)): # int 형변환 안전장치
-            min_load = None
+        for _ in range(need):
+            # (1) 배정 가능한 후보 찾기
             candidates = []
-            
-            # 1차: 자격 되고 Cap 여유 있는 사람 중 Load가 가장 적은 사람 찾기
             for i, s in enumerate(staff_list):
-                if total[i] < base_cap and is_eligible(s, type_code):
-                    if min_load is None or s.load < min_load:
-                        min_load = s.load
-            
-            # 2차: 최소 Load인 후보군 수집
-            for i, s in enumerate(staff_list):
-                if total[i] < base_cap and is_eligible(s, type_code):
-                    if min_load is None or abs(s.load - min_load) < 1e-9:
-                        candidates.append(i)
-            
-            if not candidates: 
-                continue # 배정 불가능하면 스킵
+                if assigned_period[i] >= base_cap:
+                    continue
+                if not is_eligible(s, type_code):
+                    continue
+                candidates.append(i)
 
-            # 최근 배정 이력 고려 (Random Rotation)
-            no_recent = [i for i in candidates if staff_list[i].name not in hist]
-            pick = random.choice(no_recent if no_recent else candidates)
-            
-            staff_name = staff_list[pick].name
-            hist.add(staff_name)
-            assigned[staff_name][type_code] += 1
-            total[pick] += 1
-
-    # 🔧 B안 공평성 보정 (최대-최소 격차 줄이기)
-    for _ in range(40):
-        if not total: break # 예외처리
-        max_val, min_val = max(total), min(total)
-        if max_val - min_val < 2:
-            break
-        
-        idx_max = total.index(max_val)
-        idx_min = total.index(min_val)
-        
-        moved = False
-        s_max = staff_list[idx_max]
-        s_min = staff_list[idx_min]
-        
-        for t in ["1M","1A","2A","2M"]:
-            # Max인 사람에게 해당 차종 배정이 있고, Min인 사람이 그 차종 자격이 될 때
-            if assigned[s_max.name][t] > 0 and is_eligible(s_min, t):
-                assigned[s_max.name][t] -= 1
-                assigned[s_min.name][t] += 1
-                total[idx_max] -= 1
-                total[idx_min] += 1
-                moved = True
+            if not candidates:
+                # 이 종별은 더 이상 배정할 수 없음
                 break
-        if not moved: 
-            break
 
-    # 최종 상태 업데이트
-    for i, s in enumerate(staff_list):
-        s.load += total[i]
-        s.assigned["prev_zero"] = (total[i] == 0)
+            # (2) 하루 총합(day_total) 기준 최소값 찾기
+            min_total = min(day_total[name_list[i]] for i in candidates)
+            c1 = [i for i in candidates if day_total[name_list[i]] == min_total]
 
-    # 다음 교시를 위한 플래그 설정 (코스 담당자가 배정을 많이 받았다면)
-    if is_morning and period == 1:
-        if total:
-            min_assign = min(total)
-            for i, s in enumerate(staff_list):
-                s.need_low_next = (s.is_course and total[i] > min_assign)
-    
-    save_json(HISTORY_FILE, list(hist))
-    return assigned, staff_list # 객체 상태 반환
+            # (3) 가중치(load) 기준 최소값 찾기
+            min_load = min(load_list[i] for i in c1)
+            c2 = [i for i in c1 if abs(load_list[i] - min_load) < 1e-9]
+
+            # (4) 그래도 동점이면 랜덤 Fallback
+            if len(c2) == 1:
+                pick = c2[0]
+            else:
+                # 랜덤 히스토리에 없는 사람 우선
+                no_hist = [i for i in c2 if name_list[i] not in rh_set]
+                pool = no_hist if no_hist else c2
+                pick = random.choice(pool)
+                # 랜덤 혜택 받은 사람 기록
+                if name_list[pick] not in rh_set:
+                    random_history.append(name_list[pick])
+                    rh_set.add(name_list[pick])
+
+            # (5) 배정 반영
+            pname = name_list[pick]
+            result[pname][type_code] += 1
+            assigned_period[pick] += 1
+            day_total[pname] += 1  # 하루 총합도 즉시 증가
+
+    # -------------------------
+    # 4. total_history / random_history 업데이트
+    # -------------------------
+    total_history.update(day_total)
+    save_total_history(total_history)
+    save_random_history(random_history)
+
+    return result, assigned_period
 
 ###########################################################
-# 짝짓기 로직
+# 짝짓기 로직 + 참관자 표시
 ###########################################################
 def make_pairs(staff_list, result_dict):
-    total_assign = {s.name: sum(result_dict[s.name].values()) for s in staff_list}
-    # 1명 배정자
-    list_one = [n for n, v in total_assign.items() if v == 1]
-    # 0명 배정자
-    list_zero = [n for n, v in total_assign.items() if v == 0]
-    
+    """
+    - 배정 합계가 1인 사람끼리 둘씩 짝: "A - B"
+    - 1과 0이 섞이면: "A - B(참관)"
+    """
+    total_assign = {
+        s.name: sum(result_dict[s.name].values()) for s in staff_list
+    }
+    ones = [n for n, v in total_assign.items() if v == 1]
+    zeros = [n for n, v in total_assign.items() if v == 0]
+
     pairs = []
-    # 1끼리 묶기
-    while len(list_one) >= 2:
-        a = list_one.pop(0)
-        b = list_one.pop(0)
+
+    # 1-1 짝
+    while len(ones) >= 2:
+        a = ones.pop(0)
+        b = ones.pop(0)
         pairs.append(f"{a} - {b}")
-    
-    # 남은 1과 0(참관) 묶기
-    if list_one and list_zero:
-        a = list_one.pop(0)
-        b = list_zero.pop(0)
-        pairs.append(f"{a} - {b} (참관)")
-        
-    return pairs
 
-############################################################
+    # 남은 1과 0 짝: 1 - 0(참관)
+    while ones and zeros:
+        a = ones.pop(0)
+        b = zeros.pop(0)
+        pairs.append(f"{a} - {b}(참관)")
+
+    return pairs, total_assign
+
+###########################################################
 # Streamlit UI
-############################################################
-st.title("🚗 도로주행 자동 배정 (오류 수정판)")
+###########################################################
+st.title("🚗 도로주행 자동 배정 (오전/오후 분리 + 하루 총합 우선)")
 
-tab_m, tab_a, tab_r = st.tabs(["🌅 오전 배정", "🌇 오후 배정", "🎲 랜덤결과"])
+tab_m, tab_a, tab_h = st.tabs(["🌅 오전 배정", "🌇 오후 배정", "📊 히스토리/현황"])
 
 ############################################################
 # 🌅 오전 탭
 ############################################################
 with tab_m:
     st.subheader("📥 오전 텍스트 입력")
-    text_m = st.text_area("오전 텍스트 입력 (붙여넣기)", height=150, key="txt_m")
-    period_m = st.selectbox("교시 선택", [1,2], index=0, key="sel_period_m")
+    text_m = st.text_area(
+        "오전 텍스트",
+        height=220,
+        key="txt_m",
+        placeholder="예) 25.11.03(월) 오전 교양순서 및 차량배정 ...",
+    )
 
-    if st.button("1) 근무자 자동 추출", key="m_extract"):
-        staff_names = extract_staff(text_m)
-        edu_map, course_list = extract_extra(text_m)
-        st.session_state["m_staff"] = staff_names
-        st.session_state["m_edu"] = edu_map
-        st.session_state["m_course"] = course_list
-        st.success(f"근무자 {len(staff_names)}명 추출 완료")
+    period_m = st.selectbox("오전 교시 선택", [1, 2], index=0, key="period_m")
 
-    if "m_staff" in st.session_state:
-        st.divider()
-        col_edit, col_demand = st.columns([1, 2])
-        
-        with col_edit:
-            st.subheader("✏ 근무자 확인")
-            df_m = pd.DataFrame({"근무자": st.session_state["m_staff"]})
-            edited_m = st.data_editor(df_m, num_rows="dynamic", key="edit_m")
-            final_staff_m = edited_m["근무자"].dropna().astype(str).tolist()
+    if st.button("1) 오전 근무자 자동 추출", key="m_extract"):
+        if not text_m.strip():
+            st.error("텍스트를 입력하세요.")
+        else:
+            staff_names = extract_staff(text_m)
+            st.session_state["m_staff_raw"] = staff_names
+            st.success(f"오전 근무자 {len(staff_names)}명 추출 완료")
+            st.write("👤 추출된 감독관:", staff_names)
 
-            # 교양/코스 설정
-            edu_curr = st.session_state.get("m_edu", {})
-            course_curr = st.session_state.get("m_course", [])
-            
-            st.markdown("**옵션 설정**")
-            edu_fix = st.selectbox("교양 담당자", ["(없음)"]+final_staff_m, key="m_edu_fix")
-            course_fix = st.multiselect("코스 담당자", final_staff_m,
-                default=[x for x in course_curr if x in final_staff_m],
-                key="m_course_fix")
+    if "m_staff_raw" in st.session_state:
+        st.subheader("✏ 오전 근무자 수정 (추가/삭제/변경 가능)")
+        df_m = pd.DataFrame({"감독관": st.session_state["m_staff_raw"]})
+        edited_m = st.data_editor(df_m, num_rows="dynamic", key="m_edit")
+        final_staff_m = edited_m["감독관"].dropna().tolist()
 
-        with col_demand:
-            st.subheader("📊 차량 수요 입력")
-            c1, c2, c3, c4 = st.columns(4)
-            # Key 값을 유니크하게 지정 (m_1M 등)
-            demand_m = {
-                "1M": c1.number_input("1종수동", 0, key="m_1M"),
-                "1A": c2.number_input("1종자동", 0, key="m_1A"),
-                "2A": c3.number_input("2종자동", 0, key="m_2A"),
-                "2M": c4.number_input("2종수동", 0, key="m_2M")
+        st.write("📌 최종 오전 감독관:", final_staff_m)
+
+        st.subheader("🎓 해당 교시 교양 담당자 선택")
+        edu_m = st.selectbox(
+            "교양 담당자",
+            ["(없음)"] + final_staff_m,
+            key="m_edu_sel",
+        )
+        edu_m_name = None if edu_m == "(없음)" else edu_m
+
+        st.subheader("🛠 코스 담당자 선택 (복수 선택 가능)")
+        course_m = st.multiselect(
+            "코스 담당자",
+            final_staff_m,
+            key="m_course_sel",
+        )
+
+        st.subheader("📊 오전 수요 입력")
+        c1, c2, c3, c4 = st.columns(4)
+        demand_m = {
+            "1M": c1.number_input("1종수동", min_value=0, key=f"m_1M_{period_m}"),
+            "1A": c2.number_input("1종자동", min_value=0, key=f"m_1A_{period_m}"),
+            "2A": c3.number_input("2종자동", min_value=0, key=f"m_2A_{period_m}"),
+            "2M": c4.number_input("2종수동", min_value=0, key=f"m_2M_{period_m}"),
+        }
+
+        if st.button("2) 오전 배정 실행", key="m_run"):
+            # Staff 객체 생성
+            staff_list_m = []
+            for name in final_staff_m:
+                s = Staff(name)
+                if edu_m_name and name == edu_m_name:
+                    s.is_edu = True
+                if name in course_m:
+                    s.is_course = True
+                staff_list_m.append(s)
+
+            # 한 교시 배정
+            result_m, period_total_m = assign_one_period(
+                staff_list_m,
+                period=period_m,
+                demand=demand_m,
+                is_morning=True,
+                session_key="morning",
+            )
+
+            # 출력
+            LABEL = {
+                "1M": "1종수동",
+                "1A": "1종자동",
+                "2A": "2종자동",
+                "2M": "2종수동",
             }
 
-        st.divider()
-        
-        # 실행 버튼
-        if st.button("2) 오전 배정 실행", key="m_run"):
-            staff_objects = [Staff(n) for n in final_staff_m]
-            for s in staff_objects:
-                if edu_fix == s.name:
-                    s.is_edu[period_m] = True
-                if s.name in course_fix:
-                    s.is_course = True
-            
-            result_m, updated_staff_m = assign_one_period(staff_objects, period_m, demand_m, True)
-            pairs_m = make_pairs(updated_staff_m, result_m)
-            
-            # 결과 세션 저장
-            st.session_state["result_m_data"] = result_m
-            st.session_state["result_m_pairs"] = pairs_m
-            st.session_state["result_m_staff"] = updated_staff_m
-
-        # 결과 출력 (세션에 데이터가 있으면 표시)
-        if "result_m_data" in st.session_state:
-            st.subheader(f"📌 오전 {period_m}교시 배정 결과")
-            
-            res_staff = st.session_state["result_m_staff"]
-            res_data = st.session_state["result_m_data"]
-            
+            st.subheader("📌 오전 배정 결과")
             rows = []
-            for s in res_staff:
-                info = res_data[s.name]
-                desc = [f"{k.replace('1M','1종수동').replace('1A','1종자동').replace('2A','2종자동').replace('2M','2종수동')} {v}명"
-                        for k, v in info.items() if v > 0]
-                rows.append((s.name, " / ".join(desc) if desc else "-"))
-            
-            st.table(pd.DataFrame(rows, columns=["감독관", "배정 내역"]))
+            for i, s in enumerate(staff_list_m):
+                info = result_m[s.name]
+                parts = []
+                for t in ("1M", "1A", "2A", "2M"):
+                    if info[t] > 0:
+                        parts.append(f"{LABEL[t]} {info[t]}명")
+                rows.append((s.name, " / ".join(parts) if parts else "0", period_total_m[i]))
 
-            if st.session_state["result_m_pairs"]:
-                st.markdown("#### 👥 탑승 짝짓기")
-                for p in st.session_state["result_m_pairs"]:
-                    st.success(p)
+            st.table({
+                "감독관": [r[0] for r in rows],
+                "배정": [r[1] for r in rows],
+                "해당 교시 배정합계": [r[2] for r in rows],
+            })
 
-            # 초기화 버튼 (Nested Button 문제 해결)
-            if st.button("🔄 결과 지우기 (오전)", key="m_reset"):
-                del st.session_state["result_m_data"]
-                st.rerun()
+            st.markdown("#### 👥 짝지기 결과 (1명/0명 기준)")
+            pairs_m, total_assign_m = make_pairs(staff_list_m, result_m)
+            if not pairs_m:
+                st.info("짝지을 감독관 없음")
+            else:
+                for p in pairs_m:
+                    st.write("• " + p)
+
+            st.markdown("#### 📈 이 교시 기준 감독관별 배정 합계")
+            st.table({
+                "감독관": list(total_assign_m.keys()),
+                "배정합계": list(total_assign_m.values()),
+            })
+
+        if st.button("🧹 오늘 하루 총합/랜덤 히스토리 초기화", key="reset_all_m"):
+            reset_total_history()
+            reset_random_history()
+            st.success("오늘 하루 누적 배정(total_history)와 랜덤 히스토리를 초기화했습니다.")
 
 ############################################################
 # 🌇 오후 탭
 ############################################################
 with tab_a:
     st.subheader("📥 오후 텍스트 입력")
-    text_a = st.text_area("오후 텍스트 입력 (붙여넣기)", height=150, key="txt_a")
-    period_a = st.selectbox("교시 선택", [3,4,5], index=0, key="sel_period_a")
+    text_a = st.text_area(
+        "오후 텍스트",
+        height=220,
+        key="txt_a",
+        placeholder="예) 25.11.03(월) 오후 교양순서 및 차량배정 ...",
+    )
 
-    if st.button("1) 근무자 자동 추출", key="a_extract"):
-        staff_names = extract_staff(text_a)
-        edu_map, _ = extract_extra(text_a)
-        st.session_state["a_staff"] = staff_names
-        st.session_state["a_edu"] = edu_map
-        st.success(f"근무자 {len(staff_names)}명 추출 완료")
+    period_a = st.selectbox("오후 교시 선택", [3, 4, 5], index=0, key="period_a")
 
-    if "a_staff" in st.session_state:
-        st.divider()
-        col_edit_a, col_demand_a = st.columns([1, 2])
-        
-        with col_edit_a:
-            st.subheader("✏ 근무자 확인")
-            df_a = pd.DataFrame({"근무자": st.session_state["a_staff"]})
-            edited_a = st.data_editor(df_a, num_rows="dynamic", key="edit_a")
-            final_staff_a = edited_a["근무자"].dropna().astype(str).tolist()
+    if st.button("1) 오후 근무자 자동 추출", key="a_extract"):
+        if not text_a.strip():
+            st.error("텍스트를 입력하세요.")
+        else:
+            staff_names = extract_staff(text_a)
+            st.session_state["a_staff_raw"] = staff_names
+            st.success(f"오후 근무자 {len(staff_names)}명 추출 완료")
+            st.write("👤 추출된 감독관:", staff_names)
 
-            st.markdown("**옵션 설정**")
-            edu_fix_a = st.selectbox("교양 담당자", ["(없음)"]+final_staff_a, key="a_edu_fix")
+    if "a_staff_raw" in st.session_state:
+        st.subheader("✏ 오후 근무자 수정 (추가/삭제/변경 가능)")
+        df_a = pd.DataFrame({"감독관": st.session_state["a_staff_raw"]})
+        edited_a = st.data_editor(df_a, num_rows="dynamic", key="a_edit")
+        final_staff_a = edited_a["감독관"].dropna().tolist()
 
-        with col_demand_a:
-            st.subheader("📊 차량 수요 입력")
-            c1, c2, c3, c4 = st.columns(4)
-            # Key 값을 유니크하게 지정 (a_1M 등)
-            demand_a = {
-                "1M": c1.number_input("1종수동", 0, key="a_1M"),
-                "1A": c2.number_input("1종자동", 0, key="a_1A"),
-                "2A": c3.number_input("2종자동", 0, key="a_2A"),
-                "2M": c4.number_input("2종수동", 0, key="a_2M")
-            }
+        st.write("📌 최종 오후 감독관:", final_staff_a)
 
-        st.divider()
+        st.subheader("🎓 해당 교시 교양 담당자 선택")
+        edu_a = st.selectbox(
+            "교양 담당자",
+            ["(없음)"] + final_staff_a,
+            key="a_edu_sel",
+        )
+        edu_a_name = None if edu_a == "(없음)" else edu_a
+
+        st.subheader("📊 오후 수요 입력")
+        c1, c2, c3, c4 = st.columns(4)
+        demand_a = {
+            "1M": c1.number_input("1종수동", min_value=0, key=f"a_1M_{period_a}"),
+            "1A": c2.number_input("1종자동", min_value=0, key=f"a_1A_{period_a}"),
+            "2A": c3.number_input("2종자동", min_value=0, key=f"a_2A_{period_a}"),
+            "2M": c4.number_input("2종수동", min_value=0, key=f"a_2M_{period_a}"),
+        }
 
         if st.button("2) 오후 배정 실행", key="a_run"):
-            staff_objects = [Staff(n) for n in final_staff_a]
-            for s in staff_objects:
-                if edu_fix_a == s.name:
-                    s.is_edu[period_a] = True
-            
-            result_a, updated_staff_a = assign_one_period(staff_objects, period_a, demand_a, False)
-            pairs_a = make_pairs(updated_staff_a, result_a)
-            
-            st.session_state["result_a_data"] = result_a
-            st.session_state["result_a_pairs"] = pairs_a
-            st.session_state["result_a_staff"] = updated_staff_a
+            staff_list_a = []
+            for name in final_staff_a:
+                s = Staff(name)
+                if edu_a_name and name == edu_a_name:
+                    s.is_edu = True
+                # 오후는 코스 담당자 없음
+                staff_list_a.append(s)
 
-        if "result_a_data" in st.session_state:
-            st.subheader(f"📌 오후 {period_a}교시 배정 결과")
-            
-            res_staff = st.session_state["result_a_staff"]
-            res_data = st.session_state["result_a_data"]
-            
+            result_a, period_total_a = assign_one_period(
+                staff_list_a,
+                period=period_a,
+                demand=demand_a,
+                is_morning=False,
+                session_key="afternoon",
+            )
+
+            LABEL = {
+                "1M": "1종수동",
+                "1A": "1종자동",
+                "2A": "2종자동",
+                "2M": "2종수동",
+            }
+
+            st.subheader("📌 오후 배정 결과")
             rows = []
-            for s in res_staff:
-                info = res_data[s.name]
-                desc = [f"{k.replace('1M','1종수동').replace('1A','1종자동').replace('2A','2종자동').replace('2M','2종수동')} {v}명"
-                        for k, v in info.items() if v > 0]
-                rows.append((s.name, " / ".join(desc) if desc else "-"))
-            
-            st.table(pd.DataFrame(rows, columns=["감독관", "배정 내역"]))
+            for i, s in enumerate(staff_list_a):
+                info = result_a[s.name]
+                parts = []
+                for t in ("1M", "1A", "2A", "2M"):
+                    if info[t] > 0:
+                        parts.append(f"{LABEL[t]} {info[t]}명")
+                rows.append((s.name, " / ".join(parts) if parts else "0", period_total_a[i]))
 
-            if st.session_state["result_a_pairs"]:
-                st.markdown("#### 👥 탑승 짝짓기")
-                for p in st.session_state["result_a_pairs"]:
-                    st.success(p)
+            st.table({
+                "감독관": [r[0] for r in rows],
+                "배정": [r[1] for r in rows],
+                "해당 교시 배정합계": [r[2] for r in rows],
+            })
 
-            if st.button("🔄 결과 지우기 (오후)", key="a_reset"):
-                del st.session_state["result_a_data"]
-                st.rerun()
+            st.markdown("#### 👥 짝지기 결과 (1명/0명 기준)")
+            pairs_a, total_assign_a = make_pairs(staff_list_a, result_a)
+            if not pairs_a:
+                st.info("짝지을 감독관 없음")
+            else:
+                for p in pairs_a:
+                    st.write("• " + p)
+
+            st.markdown("#### 📈 이 교시 기준 감독관별 배정 합계")
+            st.table({
+                "감독관": list(total_assign_a.keys()),
+                "배정합계": list(total_assign_a.values()),
+            })
+
+        if st.button("🧹 오늘 하루 총합/랜덤 히스토리 초기화", key="reset_all_a"):
+            reset_total_history()
+            reset_random_history()
+            st.success("오늘 하루 누적 배정(total_history)와 랜덤 히스토리를 초기화했습니다.")
 
 ############################################################
-# 🎲 랜덤 결과 탭
+# 📊 히스토리/현황 탭
 ############################################################
-with tab_r:
-    st.subheader("🎲 랜덤 우선배정 기록")
-    st.info("공평성을 위해 최근에 배정된 사람은 다음 배정 시 우선순위가 밀립니다.")
-    hist = load_json(HISTORY_FILE, [])
-    if not hist: 
-        st.write("기록이 없습니다.")
+with tab_h:
+    st.subheader("🎲 랜덤 히스토리 (오늘 랜덤 혜택 받은 감독관)")
+
+    rh = load_random_history()
+    if not rh:
+        st.info("랜덤 기록이 없습니다.")
     else:
-        st.table(pd.DataFrame({"최근 배정된 감독관": hist}))
-        
-    if st.button("🧹 랜덤 결과 초기화", key="r_reset"):
-        reset_history()
-        st.success("랜덤 결과 초기화 완료!")
-        st.rerun()
+        st.table({"순번": list(range(1, len(rh) + 1)), "감독관": rh})
 
+    if st.button("🧹 랜덤 히스토리만 초기화", key="reset_rh_only"):
+        reset_random_history()
+        st.success("랜덤 히스토리를 초기화했습니다.")
+
+    st.subheader("📊 오늘 하루 누적 배정(total_history)")
+    th = load_total_history()
+    if not th:
+        st.info("아직 누적 배정 기록이 없습니다.")
+    else:
+        names = sorted(th.keys())
+        st.table({
+            "감독관": names,
+            "하루 누적 배정횟수": [th[n] for n in names],
+        })
+
+    if st.button("🧹 하루 총합만 초기화", key="reset_th_only"):
+        reset_total_history()
+        st.success("하루 누적 배정 기록(total_history)을 초기화했습니다.")
+
+    if st.button("🧹 하루 총합 + 랜덤 모두 초기화", key="reset_all_both"):
+        reset_total_history()
+        reset_random_history()
+        st.success("하루 누적 배정과 랜덤 히스토리를 모두 초기화했습니다.")
