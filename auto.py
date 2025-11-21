@@ -123,7 +123,7 @@ def apply_session_weights(staff_list, is_morning: bool, period: int, course_carr
         * 1교시: 코스 담당자 +1
         * 2교시: 1교시에서 '많이 배정 받아서' 혜택 연장된 코스 담당자 +1 (course_carry)
     - 교양:
-        * 이 교시에서 배정을 덜 받게 할 사람(다음 교시 교양자) +1
+        * 이 교시에서 배정을 덜 받게 할 사람(=다음 교시 교양자) +1
     - 코스 + 교양이 겹쳐도 최대 1만 적용 (w > 1 이면 1로 캡)
     """
     course_carry = course_carry or []
@@ -267,7 +267,7 @@ def assign_one_period(staff_list, period: int, demand: dict,
 def make_pairs(staff_list, result_dict):
     """
     - 배정 합계가 1인 사람끼리 둘씩 짝: "A - B"
-    - 1과 0이 섞이면: "A - B(참관)"
+    - 1과 0이 섞이면: 1 - 0(참관) 형태로 짝
     """
     total_assign = {
         s.name: sum(result_dict[s.name].values()) for s in staff_list
@@ -329,17 +329,22 @@ with tab_m:
 
         st.write("📌 최종 오전 감독관:", final_staff_m)
 
-        st.subheader("🎓 이 교시에서 배정을 덜 받게 할 교양 담당자\n(다음 교시 교양 담당자를 선택하면 됨)")
-        edu_m = st.selectbox(
-            "다음 교시 교양 담당자",
-            ["(없음)"] + final_staff_m,
-            key="m_edu_sel",
-        )
-        edu_m_name = None if edu_m == "(없음)" else edu_m
+        # 🔹 교양: 항상 "다음 교시 교양자"만 선택
+        if period_m == 1:
+            st.subheader("🎓 2교시 교양 담당자 선택 (1교시에 가중치 적용)")
+            edu_sel = st.selectbox(
+                "2교시 교양 담당자",
+                ["(없음)"] + final_staff_m,
+                key="m_edu_sel",
+            )
+            edu_m_name = None if edu_sel == "(없음)" else edu_sel
+        else:  # period_m == 2
+            st.subheader("🎓 3교시 교양 담당자 없음 (오전에 가중치 없음)")
+            edu_m_name = None
 
         st.subheader("🛠 코스 담당자 선택 (복수 선택 가능, 오전 전용)")
         course_m = st.multiselect(
-            "코스 담당자",
+            "코스 담당자 (오전용)",
             final_staff_m,
             key="m_course_sel",
         )
@@ -359,9 +364,9 @@ with tab_m:
             for name in final_staff_m:
                 s = Staff(name)
                 if edu_m_name and name == edu_m_name:
-                    s.is_edu = True
+                    s.is_edu = True          # "다음 교시 교양자" → 이번 교시 가중치
                 if name in course_m:
-                    s.is_course = True
+                    s.is_course = True       # 코스 담당자
                 staff_list_m.append(s)
 
             # 2교시라면 1교시 코스 혜택 연장 대상 가져오기
@@ -468,13 +473,26 @@ with tab_a:
 
         st.write("📌 최종 오후 감독관:", final_staff_a)
 
-        st.subheader("🎓 이 교시에서 배정을 덜 받게 할 교양 담당자\n(다음 교시 교양 담당자를 선택하면 됨)")
-        edu_a = st.selectbox(
-            "다음 교시 교양 담당자",
-            ["(없음)"] + final_staff_a,
-            key="a_edu_sel",
-        )
-        edu_a_name = None if edu_a == "(없음)" else edu_a
+        # 🔹 오후도 "다음 교시 교양자"만 선택
+        if period_a == 3:
+            st.subheader("🎓 4교시 교양 담당자 선택 (3교시에 가중치 적용)")
+            edu_sel_a = st.selectbox(
+                "4교시 교양 담당자",
+                ["(없음)"] + final_staff_a,
+                key="a_edu_sel_3",
+            )
+            edu_a_name = None if edu_sel_a == "(없음)" else edu_sel_a
+        elif period_a == 4:
+            st.subheader("🎓 5교시 교양 담당자 선택 (4교시에 가중치 적용)")
+            edu_sel_a = st.selectbox(
+                "5교시 교양 담당자",
+                ["(없음)"] + final_staff_a,
+                key="a_edu_sel_4",
+            )
+            edu_a_name = None if edu_sel_a == "(없음)" else edu_sel_a
+        else:  # period_a == 5
+            st.subheader("🎓 6교시 없음 (5교시는 교양 가중치 없음)")
+            edu_a_name = None
 
         st.subheader("📊 오후 수요 입력")
         c1, c2, c3, c4 = st.columns(4)
