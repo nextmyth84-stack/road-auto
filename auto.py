@@ -2,9 +2,10 @@
 # 🚗 도로주행 자동 배정 (오전/오후 분리 + 하루 총합 우선 + 랜덤 Fallback)
 # - 오전/오후 가중치는 완전 분리
 # - 하루 총합(total_history)은 오전·오후 공통 사용
-# - 오후 신규 근무자는 오전 total의 "평균값"으로 시작
+# - 오후 신규 근무자는 오전 total의 "평균값"으로 시작(B안)
 # - 배정 우선순위: 하루 총합 → 가중치(코스/교양) → 랜덤
-# - 랜덤 히스토리는 오전·오후 공용 (오늘 중복 랜덤 방지 용도)
+# - 랜덤 히스토리는 오전·오후 공용 (오늘 중복 랜덤 방지)
+# - 코스: 1교시에서 혜택 못 받으면 2교시까지 연장
 ###############################################
 import streamlit as st
 import json, os, re, random
@@ -71,8 +72,8 @@ MANUAL_SET = {
 def extract_staff(text: str):
     """
     오전/오후 텍스트에서 도로주행 감독관 이름만 추출
-    - 1종수동: "1종수동: 9호 김주현"
-    - 2종자동: "• 6호 김지은"
+    - 1종수동: "1종수동: 7호 김남균"
+    - 2종자동: "• 5호 김병욱"
     열쇠, 1종자동(이름 없는 차량호수) 등은 무시
     """
     staff = []
@@ -95,10 +96,10 @@ class Staff:
     def __init__(self, name: str):
         self.name = name
         self.is_manual = (name in MANUAL_SET)  # 수동 가능자 여부
-        self.is_course = False                 # 코스 담당자(오전만)
-        self.is_edu = False                    # 해당 교시 교양 담당자
+        self.is_course = False                 # 코스 담당자(오전)
+        self.is_edu = False                    # 이 교시에서 가중치 받는 교양 담당자(다음 교시 교양자)
 
-        # 이 파일에서의 load는 "이 교시"에서만 사용하는 가중치
+        # 이 교시에서만 사용하는 가중치
         self.load = 0.0
 
 ###########################################################
@@ -116,33 +117,50 @@ def is_eligible(staff: Staff, type_code: str) -> bool:
 ###########################################################
 # 가중치 계산 (코스/교양, 최대 1)
 ###########################################################
-def apply_session_weights(staff_list, is_morning: bool):
+def apply_session_weights(staff_list, is_morning: bool, period: int, course_carry=None):
     """
-    - 오전: 코스 담당 + 해당 교시 교양 담당
-    - 오후: 해당 교시 교양 담당만
-    - 코스 + 교양 중복이면 최대 1만 적용
-    결과는 s.load에 반영
+    - 오전:
+        * 1교시: 코스 담당자 +1
+        * 2교시: 1교시에서 '많이 배정 받아서' 혜택 연장된 코스 담당자 +1 (course_carry)
+    - 교양:
+        * 이 교시에서 배정을 덜 받게 할 사람(다음 교시 교양자) +1
+    - 코스 + 교양이 겹쳐도 최대 1만 적용 (w > 1 이면 1로 캡)
     """
+    course_carry = course_carry or []
+
     for s in staff_list:
         w = 0.0
-        if is_morning and s.is_course:
-            w += 1.0
+
+        if is_morning:
+            # 1교시에서 코스 담당자는 +1
+            if period == 1 and s.is_course:
+                w += 1.0
+            # 2교시에서 '코스 혜택 연장 대상'이면 +1
+            if period == 2 and s.name in course_carry:
+                w += 1.0
+
+        # 교양 가중치 (다음 교시 교양자 역할)
         if s.is_edu:
             w += 1.0
+
+        # 코스 + 교양 중복 시 최대 1만
         if w > 1.0:
             w = 1.0
+
         s.load = w
 
 ###########################################################
 # 한 교시 배정 (하루 총합 우선 + 가중치 + 랜덤 Fallback)
 ###########################################################
 def assign_one_period(staff_list, period: int, demand: dict,
-                      is_morning: bool, session_key: str):
+                      is_morning: bool, session_key: str,
+                      course_carry=None):
     """
     staff_list : 이 교시의 감독관 리스트(Staff)
     demand     : {"1M": x, "1A": y, "2A": z, "2M": w}
-    is_morning : 오전 여부 (코스 가중치에만 사용)
-    session_key: "morning" 또는 "afternoon" (UI 키 구분용 아님, 의미만)
+    is_morning : 오전 여부
+    session_key: "morning" 또는 "afternoon" (의미상 태그)
+    course_carry: 2교시에서 코스 혜택 연장 대상 이름 리스트
 
     우선순위:
     1) 하루 총합(total_history) 적게 받은 사람
@@ -150,13 +168,10 @@ def assign_one_period(staff_list, period: int, demand: dict,
     3) 그래도 동점이면 랜덤 (이미 랜덤 혜택받은 이름은 최대한 제외)
     """
 
-    # -------------------------
-    # 0. 기본 설정
-    # -------------------------
     n = len(staff_list)
     result = {s.name: {"1M": 0, "1A": 0, "2A": 0, "2M": 0} for s in staff_list}
     if n == 0:
-        return result, [0] * 0  # 빈 배열
+        return result, []
 
     # 1,5교시: 최대 2명, 그 외: 최대 3명
     base_cap = 2 if period in (1, 5) else 3
@@ -166,42 +181,31 @@ def assign_one_period(staff_list, period: int, demand: dict,
     random_history = load_random_history()
     rh_set = set(random_history)
 
-    # -------------------------
-    # 1. 이 교시에서 사용할 "하루 총합" 초기값 세팅
-    #    - 오전: 없으면 0부터
-    #    - 오후: 없으면 오전 total 평균값으로 시작(B안)
-    # -------------------------
-    # 우선 현재까지의 total 목록만 떼서 평균 계산
+    # 1) 이 교시에서 사용할 day_total 초기값 세팅
     existing_totals = list(total_history.values())
     avg_total = 0
     if existing_totals:
         avg_total = round(sum(existing_totals) / len(existing_totals))
 
-    # 이 교시에서 사용하는 day_total은 total_history를 복사해서 시작
     day_total = {}
     for s in staff_list:
         if s.name in total_history:
             day_total[s.name] = total_history[s.name]
         else:
             if is_morning:
-                # 오전 신규 → 아직 하루 첫 등장 → 0부터 시작
                 day_total[s.name] = 0
             else:
-                # 오후 신규 → 오전 total의 "평균값"에서 시작
                 day_total[s.name] = avg_total
 
-    # -------------------------
-    # 2. 코스/교양 가중치 계산
-    # -------------------------
-    apply_session_weights(staff_list, is_morning=is_morning)
-    # 배열로 관리 편하게
+    # 2) 코스/교양 가중치 적용
+    apply_session_weights(staff_list, is_morning=is_morning,
+                          period=period, course_carry=course_carry)
+
     name_list = [s.name for s in staff_list]
     load_list = [s.load for s in staff_list]
-    assigned_period = [0] * n  # 이 교시에서 배정 수
+    assigned_period = [0] * n
 
-    # -------------------------
-    # 3. 종별별로 배정
-    # -------------------------
+    # 3) 종별별로 배정
     order = [
         ("1M", demand.get("1M", 0)),
         ("1A", demand.get("1A", 0)),
@@ -211,7 +215,7 @@ def assign_one_period(staff_list, period: int, demand: dict,
 
     for type_code, need in order:
         for _ in range(need):
-            # (1) 배정 가능한 후보 찾기
+            # (1) 배정 가능한 후보
             candidates = []
             for i, s in enumerate(staff_list):
                 if assigned_period[i] >= base_cap:
@@ -221,14 +225,13 @@ def assign_one_period(staff_list, period: int, demand: dict,
                 candidates.append(i)
 
             if not candidates:
-                # 이 종별은 더 이상 배정할 수 없음
                 break
 
-            # (2) 하루 총합(day_total) 기준 최소값 찾기
+            # (2) 하루 총합 기준 최소값
             min_total = min(day_total[name_list[i]] for i in candidates)
             c1 = [i for i in candidates if day_total[name_list[i]] == min_total]
 
-            # (3) 가중치(load) 기준 최소값 찾기
+            # (3) 가중치(load) 기준 최소값
             min_load = min(load_list[i] for i in c1)
             c2 = [i for i in c1 if abs(load_list[i] - min_load) < 1e-9]
 
@@ -251,9 +254,7 @@ def assign_one_period(staff_list, period: int, demand: dict,
             assigned_period[pick] += 1
             day_total[pname] += 1  # 하루 총합도 즉시 증가
 
-    # -------------------------
-    # 4. total_history / random_history 업데이트
-    # -------------------------
+    # 4) total_history / random_history 업데이트
     total_history.update(day_total)
     save_total_history(total_history)
     save_random_history(random_history)
@@ -306,7 +307,7 @@ with tab_m:
         "오전 텍스트",
         height=220,
         key="txt_m",
-        placeholder="예) 25.11.03(월) 오전 교양순서 및 차량배정 ...",
+        placeholder="예) 25.11.18(화) 오전 교양순서 및 차량배정 ...",
     )
 
     period_m = st.selectbox("오전 교시 선택", [1, 2], index=0, key="period_m")
@@ -328,15 +329,15 @@ with tab_m:
 
         st.write("📌 최종 오전 감독관:", final_staff_m)
 
-        st.subheader("🎓 해당 교시 교양 담당자 선택")
+        st.subheader("🎓 이 교시에서 배정을 덜 받게 할 교양 담당자\n(다음 교시 교양 담당자를 선택하면 됨)")
         edu_m = st.selectbox(
-            "교양 담당자",
+            "다음 교시 교양 담당자",
             ["(없음)"] + final_staff_m,
             key="m_edu_sel",
         )
         edu_m_name = None if edu_m == "(없음)" else edu_m
 
-        st.subheader("🛠 코스 담당자 선택 (복수 선택 가능)")
+        st.subheader("🛠 코스 담당자 선택 (복수 선택 가능, 오전 전용)")
         course_m = st.multiselect(
             "코스 담당자",
             final_staff_m,
@@ -363,6 +364,11 @@ with tab_m:
                     s.is_course = True
                 staff_list_m.append(s)
 
+            # 2교시라면 1교시 코스 혜택 연장 대상 가져오기
+            course_carry = None
+            if period_m == 2:
+                course_carry = st.session_state.get("course_carry_m", [])
+
             # 한 교시 배정
             result_m, period_total_m = assign_one_period(
                 staff_list_m,
@@ -370,9 +376,24 @@ with tab_m:
                 demand=demand_m,
                 is_morning=True,
                 session_key="morning",
+                course_carry=course_carry,
             )
 
-            # 출력
+            # 1교시 배정 후 → 코스 혜택 연장 대상 계산 (2교시용)
+            if period_m == 1:
+                if period_total_m:
+                    min_assign = min(period_total_m)
+                    carry_names = []
+                    for i, s in enumerate(staff_list_m):
+                        if s.name in course_m and period_total_m[i] > min_assign:
+                            carry_names.append(s.name)
+                    st.session_state["course_carry_m"] = carry_names
+                else:
+                    st.session_state["course_carry_m"] = []
+            elif period_m == 2:
+                # 2교시까지 끝났으면 코스 혜택 연장 정보 제거
+                st.session_state["course_carry_m"] = []
+
             LABEL = {
                 "1M": "1종수동",
                 "1A": "1종자동",
@@ -413,7 +434,8 @@ with tab_m:
         if st.button("🧹 오늘 하루 총합/랜덤 히스토리 초기화", key="reset_all_m"):
             reset_total_history()
             reset_random_history()
-            st.success("오늘 하루 누적 배정(total_history)와 랜덤 히스토리를 초기화했습니다.")
+            st.session_state.pop("course_carry_m", None)
+            st.success("오늘 하루 누적 배정(total_history)와 랜덤 히스토리, 코스 연장 정보를 초기화했습니다.")
 
 ############################################################
 # 🌇 오후 탭
@@ -424,7 +446,7 @@ with tab_a:
         "오후 텍스트",
         height=220,
         key="txt_a",
-        placeholder="예) 25.11.03(월) 오후 교양순서 및 차량배정 ...",
+        placeholder="예) 25.11.18(화) 오후 교양순서 및 차량배정 ...",
     )
 
     period_a = st.selectbox("오후 교시 선택", [3, 4, 5], index=0, key="period_a")
@@ -446,9 +468,9 @@ with tab_a:
 
         st.write("📌 최종 오후 감독관:", final_staff_a)
 
-        st.subheader("🎓 해당 교시 교양 담당자 선택")
+        st.subheader("🎓 이 교시에서 배정을 덜 받게 할 교양 담당자\n(다음 교시 교양 담당자를 선택하면 됨)")
         edu_a = st.selectbox(
-            "교양 담당자",
+            "다음 교시 교양 담당자",
             ["(없음)"] + final_staff_a,
             key="a_edu_sel",
         )
@@ -469,7 +491,7 @@ with tab_a:
                 s = Staff(name)
                 if edu_a_name and name == edu_a_name:
                     s.is_edu = True
-                # 오후는 코스 담당자 없음
+                # 오후에는 코스 담당 개념 없음
                 staff_list_a.append(s)
 
             result_a, period_total_a = assign_one_period(
@@ -478,6 +500,7 @@ with tab_a:
                 demand=demand_a,
                 is_morning=False,
                 session_key="afternoon",
+                course_carry=None,
             )
 
             LABEL = {
@@ -520,7 +543,8 @@ with tab_a:
         if st.button("🧹 오늘 하루 총합/랜덤 히스토리 초기화", key="reset_all_a"):
             reset_total_history()
             reset_random_history()
-            st.success("오늘 하루 누적 배정(total_history)와 랜덤 히스토리를 초기화했습니다.")
+            st.session_state.pop("course_carry_m", None)
+            st.success("오늘 하루 누적 배정(total_history)와 랜덤 히스토리, 코스 연장 정보를 초기화했습니다.")
 
 ############################################################
 # 📊 히스토리/현황 탭
@@ -556,4 +580,5 @@ with tab_h:
     if st.button("🧹 하루 총합 + 랜덤 모두 초기화", key="reset_all_both"):
         reset_total_history()
         reset_random_history()
-        st.success("하루 누적 배정과 랜덤 히스토리를 모두 초기화했습니다.")
+        st.session_state.pop("course_carry_m", None)
+        st.success("하루 누적 배정과 랜덤 히스토리, 코스 연장 정보를 모두 초기화했습니다.")
