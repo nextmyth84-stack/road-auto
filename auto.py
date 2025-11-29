@@ -421,7 +421,7 @@ with tab_m:
 with tab_a:
     st.subheader("📥 오후 텍스트 입력")
     txt_a = st.text_area("오후 텍스트 입력", height=220, key="txt_a_input")
-    period_a = st.selectbox("교시 선택",, index=0, key="period_a")[3][4][5]
+    period_a = st.selectbox("교시 선택", index=0, key="period_a")[3][4][5]
 
     if st.button("1) 근무자 자동 추출", key="extract_a"):
         if not txt_a.strip():
