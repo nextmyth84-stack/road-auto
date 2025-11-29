@@ -1,6 +1,6 @@
 ##############################################################
-# auto.py — 도로주행 자동 배정 (최종 통합판 - 몰아주기/Stacking)
-# 공평성 모델 + 코스/교양/섞임방지(Vertical Fill) + 랜덤 3일 제외
+# auto.py — 도로주행 자동 배정 (최종 통합판 - 100% 매칭 + 몰아주기)
+# 공평성 모델 + 코스/교양/섞임방지(Stacking) + 숫자 불일치 해결
 ##############################################################
 
 import streamlit as st
@@ -161,7 +161,7 @@ def pick_random_candidate(staff, idx_list, period, hist):
     return pick
 
 ##############################################################
-# 한 교시 배정 (Vertical Filling - 몰아주기 로직)
+# 한 교시 배정 (Iterative Allocation - 100% 매칭 보장)
 ##############################################################
 def assign_period(staff, period, demand, is_morning):
 
@@ -178,33 +178,13 @@ def assign_period(staff, period, demand, is_morning):
         for s in staff: s.course_penalty_next = False
     for s in staff: s.is_mixed_today = False
     
+    # 배정 전 가중치(Load) 적용
     apply_weights(staff, period)
     
     assigned = [{"1M":0,"1A":0,"2A":0,"2M":0} for _ in range(n)]
     total = [0]*n
-    assigned_count = [0] * n 
     
-    # ---------------------------------------------------------
-    # 1. 목표 배정 횟수(Target) 계산 (공평성)
-    # ---------------------------------------------------------
-    total_demand = sum(demand.values())
-    target_base = total_demand // n
-    target_rem = total_demand % n
-    
-    # Load 낮은 순으로 target +1 (기본 공평성 확보)
-    staff_indices_sorted_by_load = sorted(range(n), key=lambda i: staff[i].load)
-    target_assignment = [target_base] * n
-    for i in staff_indices_sorted_by_load[:target_rem]:
-        target_assignment[i] += 1
-    
-    # 최대 Cap 제한 적용
-    for i in range(n):
-        if target_assignment[i] > base_cap:
-             target_assignment[i] = base_cap
-    
-    # ---------------------------------------------------------
-    # 2. 배정 순서 및 실행 (Vertical Filling / 몰아주기)
-    # ---------------------------------------------------------
+    # 배정 순서
     order = [
         ("1M", demand.get("1M",0)),
         ("1A", demand.get("1A",0)),
@@ -212,102 +192,81 @@ def assign_period(staff, period, demand, is_morning):
         ("2M", demand.get("2M",0)),
     ]
 
-    # [단계 1] Target(목표치)까지 채우기
+    # ------------------------------------------------------------------
+    # 수요 하나씩 처리 (Iterative) - 숫자가 맞을 때까지 반복
+    # ------------------------------------------------------------------
     for typ, need in order:
-        if need <= 0: continue
-        
-        # 정렬 기준:
-        # 1. Load (공평성 - 일 적은 사람부터)
-        # 2. 이미 무언가 배정받았는지 (Stacking을 위해, 이 로직은 Vertical Fill이므로 Load가 더 중요)
-        candidates = [
-            i for i in range(n) 
-            if eligible(staff[i], typ) 
-            and assigned_count[i] < target_assignment[i] 
-            and total[i] < base_cap
-        ]
-        
-        # Load 낮은 순 정렬 (동점이면 앞 번호)
-        candidates.sort(key=lambda i: (staff[i].load, total[i]))
-        
-        for i in candidates:
-            if need <= 0: break
-            
-            # ** 핵심 로직: 한 사람에게 줄 수 있는 만큼 다 준다 **
-            # 1. 남은 수요 (need)
-            # 2. 이 사람의 잔여 Cap (base_cap - total[i])
-            # 3. 이 사람의 목표 할당량 잔여 (target_assignment[i] - assigned_count[i])
-            # 위 셋 중 가장 작은 값만큼 배정
-            
-            can_take = min(
-                need,
-                base_cap - total[i],
-                target_assignment[i] - assigned_count[i]
-            )
-            
-            # 단, 이미 다른 종별을 가지고 있다면(섞임 발생), 
-            # 이 단계(Target 채우기)에서는 섞임을 피하기 위해 건너뛸 수 있으면 건너뛰어야 함.
-            # 하지만 이미 Vertical Fill을 하므로, 처음 배정받는 사람이 꽉 채워갈 것임.
-            # 만약 can_take가 0보다 크면 배정.
-            
-            if can_take > 0:
-                assigned[i][typ] += can_take
-                total[i] += can_take
-                assigned_count[i] += can_take
-                need -= can_take
-
-    # [단계 2] 잔여 수요(Need > 0) 처리 (Overflow)
-    # 목표치를 다 채웠는데도 수요가 남았을 때 (Target이 작게 잡혔거나 Cap이 남을 때)
-    # 이때도 "섞이지 않는 사람"에게 우선 배정
-    
-    for typ, need in order:
-        if need <= 0: continue
-        
         while need > 0:
-            # 받을 수 있는 사람 찾기 (Cap 남은 사람)
+            # 1. 배정 가능한 후보군 찾기 (자격 O, Cap 여유 O)
             candidates = [
                 i for i in range(n)
                 if eligible(staff[i], typ) and total[i] < base_cap
             ]
             
-            if not candidates: break # 아무도 못 받음
+            # 🚨 물리적 Cap 초과 시 중단
+            if not candidates:
+                break 
 
-            # 정렬 기준:
-            # 1. 섞임 발생 여부 (0: 안섞임, 1: 섞임) -> 안 섞이는 사람 최우선
-            # 2. Load
-            
-            def overflow_sort_key(i):
-                # 다른 종별이 있는데 지금 종별이 없으면 섞이는 것
+            # 2. 정렬 키 (우선순위 결정)
+            def sort_key(i):
+                # (1) 섞임 방지 (Mixing Penalty)
+                #     Total은 있는데 이 type은 없으면 -> 섞이는 상태 (1점 penalty)
                 is_mixing = 1 if (total[i] > 0 and assigned[i].get(typ, 0) == 0) else 0
-                return (is_mixing, staff[i].load)
+                
+                # (2) 몰아주기 (Stacking Priority)
+                #     이미 이 type을 가지고 있으면 -> 0 (최우선)
+                #     아무것도 없으면 -> 1 (차선)
+                #     (섞이는 경우는 (1)에서 이미 걸러짐)
+                if assigned[i].get(typ, 0) > 0:
+                    stacking_score = 0
+                elif total[i] == 0:
+                    stacking_score = 1
+                else:
+                    stacking_score = 2 # 섞임
+                
+                # (3) Load (Fairness) - 적은 사람 우선
+                return (is_mixing, stacking_score, staff[i].load)
 
-            candidates.sort(key=overflow_sort_key)
+            # 3. 최적 후보 선정
+            #    정렬하여 1순위 그룹을 찾음
+            candidates.sort(key=sort_key)
             
-            # 최적 후보 1명 선택
             best_candidates = []
-            best_key = overflow_sort_key(candidates[0])
+            best_val = sort_key(candidates[0])
             
             for c in candidates:
-                if overflow_sort_key(c) == best_key:
+                if sort_key(c) == best_val:
                     best_candidates.append(c)
                 else:
                     break
             
+            # 4. 동점자 처리 (랜덤)
             if len(best_candidates) == 1:
                 pick = best_candidates[0]
             else:
                 pick = pick_random_candidate(staff, best_candidates, period, hist)
             
-            # 1개 배정
+            # 5. 배정 실행
             assigned[pick][typ] += 1
             total[pick] += 1
-            assigned_count[pick] += 1
             need -= 1
 
-    # 결과 정리
+    # ------------------------------------------------------------------
+    # 결과 및 상태 업데이트
+    # ------------------------------------------------------------------
+    
+    # Cap 부족 등으로 배정되지 못한 수요 체크
+    total_assigned_count = sum(total)
+    total_demand_count = sum(demand.values())
+    
+    if total_assigned_count < total_demand_count:
+        st.error(f"⚠️ **주의**: 전체 수요({total_demand_count}명)보다 배정 가능 인원({total_assigned_count}명)이 부족합니다. (근무자 부족 또는 최대 배정 인원 제한)")
+
     for i,s in enumerate(staff):
         mix_count_final = sum(1 for v in assigned[i].values() if v > 0)
         s.is_mixed_today = (mix_count_final > 1)
         s.load = float(total[i]) 
+        
         if period == 1 and s.is_course:
             s.course_penalty_next = (total[i] == 0)
 
