@@ -1,5 +1,5 @@
 ##############################################################
-# auto.py — 도로주행 자동 배정 (최종 수정: data_editor 옵션 수정)
+# auto.py — 도로주행 자동 배정 (최종 수정: 코스 점검자 방어 로직 강화)
 ##############################################################
 
 import streamlit as st
@@ -132,6 +132,7 @@ def assign_logic(staff_names, period, demand, edu_map, course_list):
             w += 1
         if next_edu_name and s.name == next_edu_name:
             w += 1
+        # 규칙 7: 가중치 중복 적용 X (최대 1)
         if w > 1: w = 1
         s.weight_val = w
 
@@ -161,6 +162,7 @@ def assign_logic(staff_names, period, demand, edu_map, course_list):
                 st.error(f"🚨 배정 불가: {typecode} 수요를 감당할 인원이 없습니다.")
                 break
 
+            # [핵심 수정] 정렬 기준 강화
             def get_penalty_score(s):
                 current_types = [t for t, c in s.assigned_counts.items() if c > 0]
                 is_mixing = False
@@ -169,11 +171,17 @@ def assign_logic(staff_names, period, demand, edu_map, course_list):
                 
                 mix_penalty = 1 if is_mixing else 0
                 effective_load = s.total_assigned + s.weight_val + mix_penalty
-                return effective_load
+                
+                # (Load점수, 가중치값) 튜플 반환
+                # 1순위: Load점수(낮은순), 2순위: 순수 가중치값(낮은순)
+                # -> Load점수가 같으면 가중치(0)인 사람이 가중치(1)인 사람보다 우선됨
+                return (effective_load, s.weight_val)
 
             candidates.sort(key=get_penalty_score)
-            min_score = get_penalty_score(candidates[0])
-            best_group = [c for c in candidates if get_penalty_score(c) == min_score]
+            
+            # 1등 그룹 추출 (튜플 비교)
+            min_score_tuple = get_penalty_score(candidates[0])
+            best_group = [c for c in candidates if get_penalty_score(c) == min_score_tuple]
 
             final_pick = None
             not_lucky_group = [c for c in best_group if not is_lucky_recently(hist, c.name)]
@@ -255,7 +263,6 @@ with tab1:
 
     st.subheader("근무자 및 담당 확인")
     m_df = pd.DataFrame({"이름": st.session_state["m_staff"]})
-    # [수정] heading_fixed=True 제거
     edited_m = st.data_editor(m_df, num_rows="dynamic", key="editor_m")
     final_m_staff = edited_m["이름"].dropna().unique().tolist()
     
@@ -332,7 +339,6 @@ with tab2:
 
     st.subheader("근무자 및 담당 확인")
     a_df = pd.DataFrame({"이름": st.session_state["a_staff"]})
-    # [수정] heading_fixed=True 제거
     edited_a = st.data_editor(a_df, num_rows="dynamic", key="editor_a")
     final_a_staff = edited_a["이름"].dropna().unique().tolist()
     
