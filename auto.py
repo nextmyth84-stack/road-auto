@@ -18,12 +18,16 @@ def load_json(path, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
+    except Exception as e:
+        st.error(f"JSON 로드 실패: {e}")
         return default
 
 def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        st.error(f"JSON 저장 실패: {e}")
 
 ##############################################################
 # 수동 가능자
@@ -38,29 +42,29 @@ MANUAL_SET = {
 ##############################################################
 def parse_staff(text):
     staff = []
-    m = re.findall(r"1종수동\s*:\s*[\d]+호\s*([가-힣]+)", text)
-    for name in m:
-        staff.append(name.strip())
+    if text:
+        m = re.findall(r"1종수동\s*:\s*[\d]+호\s*([가-힣]+)", text)
+        for name in m:
+            staff.append(name.strip())
 
-    m2 = re.findall(r"- \s*[\d]+호\s*([가-힣]+)", text)
-    for name in m2:
-        staff.append(name.strip())
-
+        m2 = re.findall(r"- \s*[\d]+호\s*([가-힣]+)", text)
+        for name in m2:
+            staff.append(name.strip())
     return list(dict.fromkeys(staff))
 
 def parse_extra(text):
     edu = {}
-    m = re.findall(r"(\d)교시\s*:\s*([가-힣]+)", text)
-    for gyo, nm in m:
-        edu[int(gyo)] = nm.strip()
-
     course = []
-    m2 = re.findall(r"코스점검\s*:\s*(.*)", text)
-    if m2:
-        body = m2
-        mm = re.findall(r"[A-Z]코스.*?:\s*([가-힣]+)", body)
-        course = [x.strip() for x in mm]
+    if text:
+        m = re.findall(r"(\d)교시\s*:\s*([가-힣]+)", text)
+        for gyo, nm in m:
+            edu[int(gyo)] = nm.strip()
 
+        m2 = re.findall(r"코스점검\s*:\s*(.*)", text)
+        if m2:
+            body = m2
+            mm = re.findall(r"[A-Z]코스.*?:\s*([가-힣]+)", body)
+            course = [x.strip() for x in mm]
     return edu, course
 
 ##############################################################
@@ -72,7 +76,6 @@ class Staff:
         self.is_manual = (name in MANUAL_SET)
         self.is_course = False
         self.is_edu = {i:False for i in range(1,6)}
-
         self.load = 0
         self.course_penalty_next = False
         self.is_mixed_today = False
@@ -89,9 +92,10 @@ def save_history(hist):
 def used_recently(hist, name):
     today = date.today()
     for h in hist:
-        d = date.fromisoformat(h["date"])
-        if h.get("type") == "random_pick" and (today - d).days <= 3 and h["name"] == name:
-            return True
+        if h.get("type") == "random_pick" and h.get("name") == name:
+            d = date.fromisoformat(h["date"])
+            if (today - d).days <= 3:
+                return True
     return False
 
 def record_random(hist, name, period):
@@ -141,7 +145,7 @@ def apply_weights(staff, period):
         elif period == 4:
             target_edu_period = 5
 
-        if target_edu_period and s.is_edu.get(target_edu_period):
+        if target_edu_period and s.is_edu.get(target_edu_period, False):
             w += 1
 
         if w > 1:
@@ -161,10 +165,9 @@ def pick_random_candidate(staff, idx_list, period, hist):
     return pick
 
 ##############################################################
-# 한 교시 배정 (종별 섞임 최소화/연속배정 우선 반영)
+# 한 교시 배정 (에러 수정 및 종별 섞임 최소화)
 ##############################################################
 def assign_period(staff, period, demand, is_morning):
-
     BASE_CAP_MAP = {1: 2, 2: 3, 3: 3, 4: 3, 5: 2}
     base_cap = BASE_CAP_MAP.get(period, 3)
 
@@ -186,6 +189,9 @@ def assign_period(staff, period, demand, is_morning):
     total = *n
 
     total_demand = sum(demand.values())
+    if n == 0:
+        return assigned, total
+
     target_base = total_demand // n
     target_rem = total_demand % n
 
@@ -231,7 +237,7 @@ def assign_period(staff, period, demand, is_morning):
         sorted_indices = sorted(eligible_for_typ, key=sort_key)
 
         for i in sorted_indices:
-            if current_need == 0:
+            if current_need <= 0:
                 break
 
             assigned[i][typ] += 1
@@ -242,7 +248,6 @@ def assign_period(staff, period, demand, is_morning):
     # 2차 배정: 잔여 수요 재배정
     for typ, _ in order:
         while demand.get(typ, 0) > sum(a[typ] for a in assigned):
-
             current_loads = []
             for i, s in enumerate(staff):
                 is_mixing = total[i] > 0 and assigned[i].get(typ, 0) == 0
@@ -285,9 +290,7 @@ def assign_period(staff, period, demand, is_morning):
     for i,s in enumerate(staff):
         mix_count_final = sum(1 for v in assigned[i].values() if v > 0)
         s.is_mixed_today = (mix_count_final > 1)
-
         s.load = float(total[i])
-
         if period == 1 and s.is_course:
             s.course_penalty_next = (total[i] == 0)
 
@@ -332,7 +335,7 @@ tab_m, tab_a, tab_r = st.tabs(["🌅 오전 배정", "🌇 오후 배정", "🎲
 with tab_m:
     st.subheader("📥 오전 텍스트 입력")
     txt_m = st.text_area("오전 텍스트 입력", height=220, key="txt_m_input")
-    period_m = st.selectbox("교시 선택", index=0, key="period_m")[1][2]
+    period_m = st.selectbox("교시 선택",, index=0, key="period_m")[1][2]
 
     if st.button("1) 근무자 자동 추출", key="extract_m"):
         if not txt_m.strip():
@@ -377,51 +380,54 @@ with tab_m:
         }
 
         if st.button("2) 오전 배정 실행", key="run_m"):
-            staff_list = []
-            for nm in st.session_state["m_staff"]:
-                s = Staff(nm)
-                staff_list.append(s)
-            for s in staff_list:
-                if s.name in st.session_state["m_course_sel"]:
-                    s.is_course = True
-            if st.session_state["m_edu_sel"].get(2):
-                edu_nm = st.session_state["m_edu_sel"][2]
-                for s in staff_list:
-                    if s.name == edu_nm:
-                        s.is_edu = True[2]
-
-            assigned, total = assign_period(staff_list, period_m, demand_m, is_morning=True)
-
-            st.subheader("📌 배정 결과")
-            rows = []
-            for i,s in enumerate(staff_list):
-                info = assigned[i]
-                desc = []
-                for t in ("1M","1A","2A","2M"):
-                    if info[t] > 0:
-                        tt = {"1M":"1종수동", "1A":"1종자동",
-                              "2A":"2종자동", "2M":"2종수동"}[t]
-                        desc.append(f"{tt} {info[t]}명")
-                rows.append([s.name, " / ".join(desc) if desc else "0"])
-            st.table(pd.DataFrame(rows, columns=["감독관","배정"]))
-
-            st.subheader("🔢 최종 Load(누적 배정수)")
-            st.table(pd.DataFrame({
-                "감독관":[s.name for s in staff_list],
-                "Load":[float(s.load) for s in staff_list]
-            }))
-
-            st.subheader("🤝 Pairing 결과(배정 1·0 대상)")
-            pairs = pair_results(staff_list, total)
-            if pairs:
-                st.write("\n".join(pairs))
+            if not st.session_state.get("m_staff"):
+                st.error("근무자 목록이 없습니다.")
             else:
-                st.write("pairing 없음")
+                staff_list = []
+                for nm in st.session_state["m_staff"]:
+                    s = Staff(nm)
+                    staff_list.append(s)
+                for s in staff_list:
+                    if s.name in st.session_state["m_course_sel"]:
+                        s.is_course = True
+                if st.session_state["m_edu_sel"].get(2):
+                    edu_nm = st.session_state["m_edu_sel"][2]
+                    for s in staff_list:
+                        if s.name == edu_nm:
+                            s.is_edu = True[2]
+
+                assigned, total = assign_period(staff_list, period_m, demand_m, is_morning=True)
+
+                st.subheader("📌 배정 결과")
+                rows = []
+                for i,s in enumerate(staff_list):
+                    info = assigned[i]
+                    desc = []
+                    for t in ("1M","1A","2A","2M"):
+                        if info[t] > 0:
+                            tt = {"1M":"1종수동", "1A":"1종자동",
+                                  "2A":"2종자동", "2M":"2종수동"}[t]
+                            desc.append(f"{tt} {info[t]}명")
+                    rows.append([s.name, " / ".join(desc) if desc else "0"])
+                st.table(pd.DataFrame(rows, columns=["감독관","배정"]))
+
+                st.subheader("🔢 최종 Load(누적 배정수)")
+                st.table(pd.DataFrame({
+                    "감독관":[s.name for s in staff_list],
+                    "Load":[float(s.load) for s in staff_list]
+                }))
+
+                st.subheader("🤝 Pairing 결과(배정 1·0 대상)")
+                pairs = pair_results(staff_list, total)
+                if pairs:
+                    st.write("\n".join(pairs))
+                else:
+                    st.write("pairing 없음")
 
 with tab_a:
     st.subheader("📥 오후 텍스트 입력")
     txt_a = st.text_area("오후 텍스트 입력", height=220, key="txt_a_input")
-    period_a = st.selectbox("교시 선택", index=0, key="period_a")[3][4][5]
+    period_a = st.selectbox("교시 선택",, index=0, key="period_a")[3][4][5]
 
     if st.button("1) 근무자 자동 추출", key="extract_a"):
         if not txt_a.strip():
@@ -466,37 +472,40 @@ with tab_a:
         }
 
         if st.button("2) 오후 배정 실행", key="run_a"):
-            staff_list = [Staff(nm) for nm in final_a]
-            for k,nm in st.session_state["a_edu_sel"].items():
-                if nm:
-                    for s in staff_list:
-                        if s.name == nm:
-                            s.is_edu[k] = True
+            if not st.session_state.get("a_staff"):
+                st.error("근무자 목록이 없습니다.")
+            else:
+                staff_list = [Staff(nm) for nm in final_a]
+                for k,nm in st.session_state["a_edu_sel"].items():
+                    if nm:
+                        for s in staff_list:
+                            if s.name == nm:
+                                s.is_edu[k] = True
 
-            assigned, total = assign_period(staff_list, period_a, demand_a, is_morning=False)
+                assigned, total = assign_period(staff_list, period_a, demand_a, is_morning=False)
 
-            st.subheader("📌 배정 결과")
-            rows = []
-            for i,s in enumerate(staff_list):
-                info = assigned[i]
-                desc = []
-                for t in ("1M","1A","2A","2M"):
-                    if info[t] > 0:
-                        tt = {"1M":"1종수동", "1A":"1종자동",
-                              "2A":"2종자동", "2M":"2종수동"}[t]
-                        desc.append(f"{tt} {info[t]}명")
-                rows.append([s.name, " / ".join(desc) if desc else "0"])
-            st.table(pd.DataFrame(rows, columns=["감독관","배정"]))
+                st.subheader("📌 배정 결과")
+                rows = []
+                for i,s in enumerate(staff_list):
+                    info = assigned[i]
+                    desc = []
+                    for t in ("1M","1A","2A","2M"):
+                        if info[t] > 0:
+                            tt = {"1M":"1종수동", "1A":"1종자동",
+                                  "2A":"2종자동", "2M":"2종수동"}[t]
+                            desc.append(f"{tt} {info[t]}명")
+                    rows.append([s.name, " / ".join(desc) if desc else "0"])
+                st.table(pd.DataFrame(rows, columns=["감독관","배정"]))
 
-            st.subheader("🔢 최종 Load(누적 배정수)")
-            st.table(pd.DataFrame({
-                "감독관":[s.name for s in staff_list],
-                "Load":[float(s.load) for s in staff_list]
-            }))
+                st.subheader("🔢 최종 Load(누적 배정수)")
+                st.table(pd.DataFrame({
+                    "감독관":[s.name for s in staff_list],
+                    "Load":[float(s.load) for s in staff_list]
+                }))
 
-            st.subheader("🤝 Pairing 결과")
-            pairs = pair_results(staff_list, total)
-            st.write("\n".join(pairs) if pairs else "pairing 없음")
+                st.subheader("🤝 Pairing 결과")
+                pairs = pair_results(staff_list, total)
+                st.write("\n".join(pairs) if pairs else "pairing 없음")
 
 with tab_r:
     st.subheader("🎲 랜덤 배정 히스토리(최근 3일)")
