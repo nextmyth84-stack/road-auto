@@ -1,5 +1,5 @@
 ##############################################################
-# auto.py — 도로주행 자동 배정 (최종: 종별 섞임 최소화 로직 강화)
+# auto.py — 도로주행 자동 배정 (최종: 코스 점검자 절대 보호 모드)
 ##############################################################
 
 import streamlit as st
@@ -168,44 +168,38 @@ def assign_logic(staff_names, period, demand, edu_map, course_list):
                 st.error(f"🚨 배정 불가: {typecode} 수요를 감당할 인원이 없습니다.")
                 break
 
-            # [핵심 수정] 페널티 점수 계산 (종별 섞임 정밀 제어)
-            def get_penalty_score(s):
-                # 현재 가지고 있는 종별들
-                my_types = [t for t, c in s.assigned_counts.items() if c > 0]
+            # [수정된 정렬 로직] 코스점검자 보호 최우선
+            def get_priority_key(s):
+                # 1. 가중치 값 (코스점검자=1, 일반=0) -> 낮을수록 우선 (일반인이 먼저 뽑힘)
+                #    이것이 1순위 키이므로, 코스점검자는 무조건 뒤로 밀림.
+                priority_weight = s.weight_val
                 
+                # 2. 현재 배정된 총 개수 -> 적게 일한 사람 우선
+                priority_count = s.total_assigned
+                
+                # 3. 종별 섞임 페널티
+                my_types = [t for t, c in s.assigned_counts.items() if c > 0]
                 mix_penalty = 0.0
                 if my_types:
                     if typecode in my_types:
-                        # 1. 같은 종별 (Best)
-                        mix_penalty = 0.0
+                        mix_penalty = 0.0 # 동일 종별 (Best)
                     else:
-                        # 2. 다른 종별 -> 변속기 확인
-                        # 보유한 종별 중 하나라도 '다른 변속기'가 있으면 큰 페널티
-                        has_diff_trans = False
-                        for t in my_types:
-                            if get_transmission_type(t) != current_trans:
-                                has_diff_trans = True
-                                break
-                        
+                        # 변속기 다르면 큰 페널티
+                        has_diff_trans = any(get_transmission_type(t) != current_trans for t in my_types)
                         if has_diff_trans:
-                            mix_penalty = 1.0  # 수동 vs 자동 (피해야 함)
+                            mix_penalty = 10.0 # 절대 피함
                         else:
-                            mix_penalty = 0.1  # 자동 vs 자동 (1A+2A 등, 허용 범위)
+                            mix_penalty = 1.0  # 같은 변속기 다른 종별 (차선)
 
-                # 총 부하 = 실제 배정 + 가중치 + 혼합 페널티
-                effective_load = s.total_assigned + s.weight_val + mix_penalty
-                
-                # 정렬 기준: 
-                # 1순위: 유효 부하 (낮은 순)
-                # 2순위: 페널티 점수 (같은 부하일 때 '덜 섞이는' 사람 우선)
-                # 3순위: 가중치 값
-                return (effective_load, mix_penalty, s.weight_val)
+                # 정렬 키: (가중치, 배정수, 섞임페널티) 순서대로 낮은 값이 우선
+                return (priority_weight, priority_count, mix_penalty)
 
-            candidates.sort(key=get_penalty_score)
+            # 정렬 수행
+            candidates.sort(key=get_priority_key)
             
             # 1등 그룹 추출
-            min_score_tuple = get_penalty_score(candidates[0])
-            best_group = [c for c in candidates if get_penalty_score(c) == min_score_tuple]
+            min_key = get_priority_key(candidates[0])
+            best_group = [c for c in candidates if get_priority_key(c) == min_key]
 
             # 랜덤 추첨 (히스토리 반영)
             final_pick = None
