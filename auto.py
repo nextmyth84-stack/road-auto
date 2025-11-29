@@ -1,5 +1,5 @@
 ##############################################################
-# auto.py — 도로주행 자동 배정 (최종: 코스 점검자 절대 보호 모드)
+# auto.py — 도로주행 자동 배정 (최종: 공평성 절대 보장 버전)
 ##############################################################
 
 import streamlit as st
@@ -168,33 +168,33 @@ def assign_logic(staff_names, period, demand, edu_map, course_list):
                 st.error(f"🚨 배정 불가: {typecode} 수요를 감당할 인원이 없습니다.")
                 break
 
-            # [수정된 정렬 로직] 코스점검자 보호 최우선
+            # [최종 수정] 정렬 우선순위 계층화
+            # 1순위: 총 배정 수 (낮은 순) -> 공평성 절대 보장
+            # 2순위: 섞임 페널티 (낮은 순) -> 배정 수가 같으면 덜 섞이는 쪽으로
+            # 3순위: 가중치 (낮은 순) -> 조건이 다 같으면 코스점검자(가중치1)가 나중에
             def get_priority_key(s):
-                # 1. 가중치 값 (코스점검자=1, 일반=0) -> 낮을수록 우선 (일반인이 먼저 뽑힘)
-                #    이것이 1순위 키이므로, 코스점검자는 무조건 뒤로 밀림.
-                priority_weight = s.weight_val
+                # 1. 총 배정 수 (Absolute Equality)
+                p_count = s.total_assigned
                 
-                # 2. 현재 배정된 총 개수 -> 적게 일한 사람 우선
-                priority_count = s.total_assigned
-                
-                # 3. 종별 섞임 페널티
+                # 2. 섞임 페널티
                 my_types = [t for t, c in s.assigned_counts.items() if c > 0]
-                mix_penalty = 0.0
+                mix_score = 0
                 if my_types:
                     if typecode in my_types:
-                        mix_penalty = 0.0 # 동일 종별 (Best)
+                        mix_score = 0
                     else:
                         # 변속기 다르면 큰 페널티
-                        has_diff_trans = any(get_transmission_type(t) != current_trans for t in my_types)
-                        if has_diff_trans:
-                            mix_penalty = 10.0 # 절대 피함
+                        if any(get_transmission_type(t) != current_trans for t in my_types):
+                            mix_score = 10  # Critical Mix
                         else:
-                            mix_penalty = 1.0  # 같은 변속기 다른 종별 (차선)
+                            mix_score = 1   # Minor Mix
+                
+                # 3. 가중치 (Weight)
+                p_weight = s.weight_val
 
-                # 정렬 키: (가중치, 배정수, 섞임페널티) 순서대로 낮은 값이 우선
-                return (priority_weight, priority_count, mix_penalty)
+                return (p_count, mix_score, p_weight)
 
-            # 정렬 수행
+            # 정렬
             candidates.sort(key=get_priority_key)
             
             # 1등 그룹 추출
