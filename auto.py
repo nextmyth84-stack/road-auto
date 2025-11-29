@@ -1,5 +1,5 @@
 ##############################################################
-# auto.py — 도로주행 자동 배정 (최종 수정: 코스 점검자 방어 로직 강화)
+# auto.py — 도로주행 자동 배정 (최종: 종별 섞임 최소화 로직 강화)
 ##############################################################
 
 import streamlit as st
@@ -73,7 +73,6 @@ class Staff:
         self.name = name
         self.is_manual = (name in MANUAL_SET)
         self.is_course = False
-        self.is_edu_next = False  
         self.assigned_counts = {"1M":0, "1A":0, "2A":0, "2M":0}
         self.total_assigned = 0
         self.weight_val = 0 
@@ -116,9 +115,16 @@ def eligible(staff_obj, typecode):
         return True
     return typecode in ("1A", "2A")
 
+def get_transmission_type(typecode):
+    """종별 코드에서 변속기 타입 추출 (Manual/Auto)"""
+    if "M" in typecode: return "Manual"
+    if "A" in typecode: return "Auto"
+    return "Unknown"
+
 def assign_logic(staff_names, period, demand, edu_map, course_list):
     staff_objs = [Staff(nm) for nm in staff_names]
     
+    # 가중치 설정
     target_edu_period = None
     if period == 1: target_edu_period = 2
     elif period == 3: target_edu_period = 4
@@ -128,17 +134,15 @@ def assign_logic(staff_names, period, demand, edu_map, course_list):
 
     for s in staff_objs:
         w = 0
-        if s.name in course_list:
-            w += 1
-        if next_edu_name and s.name == next_edu_name:
-            w += 1
-        # 규칙 7: 가중치 중복 적용 X (최대 1)
+        if s.name in course_list: w += 1
+        if next_edu_name and s.name == next_edu_name: w += 1
         if w > 1: w = 1
         s.weight_val = w
 
     CAP_MAP = {1:2, 2:3, 3:3, 4:3, 5:2}
     limit_per_person = CAP_MAP.get(period, 3)
 
+    # 히스토리 로드
     hist = load_history()
     if check_history_full(hist, staff_names):
         hist = [] 
@@ -152,6 +156,8 @@ def assign_logic(staff_names, period, demand, edu_map, course_list):
     ]
 
     for typecode, count in order:
+        current_trans = get_transmission_type(typecode)
+        
         for _ in range(count):
             candidates = [
                 s for s in staff_objs 
@@ -162,27 +168,46 @@ def assign_logic(staff_names, period, demand, edu_map, course_list):
                 st.error(f"🚨 배정 불가: {typecode} 수요를 감당할 인원이 없습니다.")
                 break
 
-            # [핵심 수정] 정렬 기준 강화
+            # [핵심 수정] 페널티 점수 계산 (종별 섞임 정밀 제어)
             def get_penalty_score(s):
-                current_types = [t for t, c in s.assigned_counts.items() if c > 0]
-                is_mixing = False
-                if current_types and typecode not in current_types:
-                    is_mixing = True
+                # 현재 가지고 있는 종별들
+                my_types = [t for t, c in s.assigned_counts.items() if c > 0]
                 
-                mix_penalty = 1 if is_mixing else 0
+                mix_penalty = 0.0
+                if my_types:
+                    if typecode in my_types:
+                        # 1. 같은 종별 (Best)
+                        mix_penalty = 0.0
+                    else:
+                        # 2. 다른 종별 -> 변속기 확인
+                        # 보유한 종별 중 하나라도 '다른 변속기'가 있으면 큰 페널티
+                        has_diff_trans = False
+                        for t in my_types:
+                            if get_transmission_type(t) != current_trans:
+                                has_diff_trans = True
+                                break
+                        
+                        if has_diff_trans:
+                            mix_penalty = 1.0  # 수동 vs 자동 (피해야 함)
+                        else:
+                            mix_penalty = 0.1  # 자동 vs 자동 (1A+2A 등, 허용 범위)
+
+                # 총 부하 = 실제 배정 + 가중치 + 혼합 페널티
                 effective_load = s.total_assigned + s.weight_val + mix_penalty
                 
-                # (Load점수, 가중치값) 튜플 반환
-                # 1순위: Load점수(낮은순), 2순위: 순수 가중치값(낮은순)
-                # -> Load점수가 같으면 가중치(0)인 사람이 가중치(1)인 사람보다 우선됨
-                return (effective_load, s.weight_val)
+                # 정렬 기준: 
+                # 1순위: 유효 부하 (낮은 순)
+                # 2순위: 페널티 점수 (같은 부하일 때 '덜 섞이는' 사람 우선)
+                # 3순위: 가중치 값
+                return (effective_load, mix_penalty, s.weight_val)
 
             candidates.sort(key=get_penalty_score)
             
-            # 1등 그룹 추출 (튜플 비교)
+            # 1등 그룹 추출
             min_score_tuple = get_penalty_score(candidates[0])
             best_group = [c for c in candidates if get_penalty_score(c) == min_score_tuple]
 
+            # 랜덤 추첨 (히스토리 반영)
             final_pick = None
             not_lucky_group = [c for c in best_group if not is_lucky_recently(hist, c.name)]
             
@@ -194,6 +219,7 @@ def assign_logic(staff_names, period, demand, edu_map, course_list):
             final_pick.assigned_counts[typecode] += 1
             final_pick.total_assigned += 1
 
+    # 히스토리 업데이트
     if staff_objs:
         min_assigned = min(s.total_assigned for s in staff_objs)
         lucky_people = [s.name for s in staff_objs if s.total_assigned == min_assigned]
