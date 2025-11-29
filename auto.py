@@ -1,6 +1,6 @@
 ##############################################################
-# auto.py — 도로주행 자동 배정 (최종 통합판 - 연속 배정 우선)
-# 공평성 모델 + 코스/교양/섞임방지(Stacking) + 랜덤 3일 제외
+# auto.py — 도로주행 자동 배정 (최종 통합판 - 몰아주기/Stacking)
+# 공평성 모델 + 코스/교양/섞임방지(Vertical Fill) + 랜덤 3일 제외
 ##############################################################
 
 import streamlit as st
@@ -161,7 +161,7 @@ def pick_random_candidate(staff, idx_list, period, hist):
     return pick
 
 ##############################################################
-# 한 교시 배정 (핵심 로직 수정)
+# 한 교시 배정 (Vertical Filling - 몰아주기 로직)
 ##############################################################
 def assign_period(staff, period, demand, is_morning):
 
@@ -182,24 +182,29 @@ def assign_period(staff, period, demand, is_morning):
     
     assigned = [{"1M":0,"1A":0,"2A":0,"2M":0} for _ in range(n)]
     total = [0]*n
+    assigned_count = [0] * n 
     
-    # 목표 배정 횟수 설정
+    # ---------------------------------------------------------
+    # 1. 목표 배정 횟수(Target) 계산 (공평성)
+    # ---------------------------------------------------------
     total_demand = sum(demand.values())
     target_base = total_demand // n
     target_rem = total_demand % n
     
-    # Load 낮은 순으로 target +1 부여
-    staff_indices_sorted = sorted(range(n), key=lambda i: staff[i].load)
+    # Load 낮은 순으로 target +1 (기본 공평성 확보)
+    staff_indices_sorted_by_load = sorted(range(n), key=lambda i: staff[i].load)
     target_assignment = [target_base] * n
-    for i in staff_indices_sorted[:target_rem]:
+    for i in staff_indices_sorted_by_load[:target_rem]:
         target_assignment[i] += 1
     
-    # Cap 적용
+    # 최대 Cap 제한 적용
     for i in range(n):
         if target_assignment[i] > base_cap:
              target_assignment[i] = base_cap
     
-    # 배정 순서
+    # ---------------------------------------------------------
+    # 2. 배정 순서 및 실행 (Vertical Filling / 몰아주기)
+    # ---------------------------------------------------------
     order = [
         ("1M", demand.get("1M",0)),
         ("1A", demand.get("1A",0)),
@@ -207,106 +212,102 @@ def assign_period(staff, period, demand, is_morning):
         ("2M", demand.get("2M",0)),
     ]
 
-    assigned_count = [0] * n 
-    
-    # ---------------------------------------------------------
-    # 1차 배정: 목표 횟수(target_assignment) 채우기
-    # ---------------------------------------------------------
+    # [단계 1] Target(목표치)까지 채우기
     for typ, need in order:
-        current_need = need
+        if need <= 0: continue
         
-        # 해당 종별(typ)을 받을 수 있는 후보군 필터링
-        eligible_for_typ = [
-            i for i, s in enumerate(staff) 
-            if eligible(s, typ) 
+        # 정렬 기준:
+        # 1. Load (공평성 - 일 적은 사람부터)
+        # 2. 이미 무언가 배정받았는지 (Stacking을 위해, 이 로직은 Vertical Fill이므로 Load가 더 중요)
+        candidates = [
+            i for i in range(n) 
+            if eligible(staff[i], typ) 
             and assigned_count[i] < target_assignment[i] 
             and total[i] < base_cap
         ]
         
-        # ⭐ 정렬 기준 수정 (여기가 핵심) ⭐
-        def sort_key(i):
-            # 1. 섞임 발생 여부 (가장 중요: 0이 좋음)
-            #    (총 배정이 있는데, 이 종별은 없다면 섞이는 것)
-            is_mixing = 1 if (total[i] > 0 and assigned[i].get(typ, 0) == 0) else 0
-            
-            # 2. 연속 배정(Stacking) 우선 (Empty보다 우선)
-            #    이미 이 종별을 1개 이상 가지고 있다면 -> 우선순위 높음 (-1)
-            #    아무것도 안 가진 사람(Empty) -> 보통 (0)
-            #    (오름차순 정렬이므로 작은 값이 먼저 옴)
-            has_type_priority = -1 if assigned[i].get(typ, 0) > 0 else 0
-            
-            # 3. Load (Fairness)
-            return (is_mixing, has_type_priority, staff[i].load)
-
-        # 정렬 수행
-        sorted_indices = sorted(eligible_for_typ, key=sort_key)
+        # Load 낮은 순 정렬 (동점이면 앞 번호)
+        candidates.sort(key=lambda i: (staff[i].load, total[i]))
         
-        # 배정
-        for i in sorted_indices:
-            if current_need == 0:
-                break
+        for i in candidates:
+            if need <= 0: break
             
-            assigned[i][typ] += 1
-            total[i] += 1
-            assigned_count[i] += 1
-            current_need -= 1
+            # ** 핵심 로직: 한 사람에게 줄 수 있는 만큼 다 준다 **
+            # 1. 남은 수요 (need)
+            # 2. 이 사람의 잔여 Cap (base_cap - total[i])
+            # 3. 이 사람의 목표 할당량 잔여 (target_assignment[i] - assigned_count[i])
+            # 위 셋 중 가장 작은 값만큼 배정
+            
+            can_take = min(
+                need,
+                base_cap - total[i],
+                target_assignment[i] - assigned_count[i]
+            )
+            
+            # 단, 이미 다른 종별을 가지고 있다면(섞임 발생), 
+            # 이 단계(Target 채우기)에서는 섞임을 피하기 위해 건너뛸 수 있으면 건너뛰어야 함.
+            # 하지만 이미 Vertical Fill을 하므로, 처음 배정받는 사람이 꽉 채워갈 것임.
+            # 만약 can_take가 0보다 크면 배정.
+            
+            if can_take > 0:
+                assigned[i][typ] += can_take
+                total[i] += can_take
+                assigned_count[i] += can_take
+                need -= can_take
+
+    # [단계 2] 잔여 수요(Need > 0) 처리 (Overflow)
+    # 목표치를 다 채웠는데도 수요가 남았을 때 (Target이 작게 잡혔거나 Cap이 남을 때)
+    # 이때도 "섞이지 않는 사람"에게 우선 배정
     
-    # ---------------------------------------------------------
-    # 2차 배정: 잔여 수요 재배정 (목표 횟수 이상 배정해야 할 때)
-    # ---------------------------------------------------------
-    for typ, _ in order:
-        while demand.get(typ, 0) > sum(a[typ] for a in assigned):
-            
-            # 현재 시점의 Load 계산 (섞임 패널티 포함)
-            current_loads = []
-            for i, s in enumerate(staff):
-                is_mixing = total[i] > 0 and assigned[i].get(typ, 0) == 0
-                mix_penalty = 1 if is_mixing else 0
-                current_loads.append(float(s.load) + mix_penalty)
-            
-            min_val = None
-            eligible_indices = [
-                i for i, s in enumerate(staff)
-                if eligible(s, typ) and total[i] < base_cap
+    for typ, need in order:
+        if need <= 0: continue
+        
+        while need > 0:
+            # 받을 수 있는 사람 찾기 (Cap 남은 사람)
+            candidates = [
+                i for i in range(n)
+                if eligible(staff[i], typ) and total[i] < base_cap
             ]
             
-            if not eligible_indices: break
+            if not candidates: break # 아무도 못 받음
 
-            # 최소 Load 찾기
-            for i in eligible_indices:
-                if min_val is None or current_loads[i] < min_val:
-                    min_val = current_loads[i]
+            # 정렬 기준:
+            # 1. 섞임 발생 여부 (0: 안섞임, 1: 섞임) -> 안 섞이는 사람 최우선
+            # 2. Load
+            
+            def overflow_sort_key(i):
+                # 다른 종별이 있는데 지금 종별이 없으면 섞이는 것
+                is_mixing = 1 if (total[i] > 0 and assigned[i].get(typ, 0) == 0) else 0
+                return (is_mixing, staff[i].load)
 
-            if min_val is None: break
-                
-            # 동점자 그룹
-            idx_list = [
-                i for i in eligible_indices
-                if abs(current_loads[i] - min_val) < 1e-9
-            ]
+            candidates.sort(key=overflow_sort_key)
             
-            # 만약 최소 Load인 사람들이 모두 꽉 찼다면 다음 순위 찾기
-            if not idx_list:
-                # (생략 가능하지만 안전장치)
-                break 
+            # 최적 후보 1명 선택
+            best_candidates = []
+            best_key = overflow_sort_key(candidates[0])
             
-            # 랜덤 선정
-            if len(idx_list) == 1:
-                pick = idx_list[0]
+            for c in candidates:
+                if overflow_sort_key(c) == best_key:
+                    best_candidates.append(c)
+                else:
+                    break
+            
+            if len(best_candidates) == 1:
+                pick = best_candidates[0]
             else:
-                pick = pick_random_candidate(staff, idx_list, period, hist)
-
+                pick = pick_random_candidate(staff, best_candidates, period, hist)
+            
+            # 1개 배정
             assigned[pick][typ] += 1
             total[pick] += 1
             assigned_count[pick] += 1
+            need -= 1
 
-    # Load 누적 및 코스 연장 설정
+    # 결과 정리
     for i,s in enumerate(staff):
         mix_count_final = sum(1 for v in assigned[i].values() if v > 0)
         s.is_mixed_today = (mix_count_final > 1)
-
         s.load = float(total[i]) 
-        
         if period == 1 and s.is_course:
             s.course_penalty_next = (total[i] == 0)
 
