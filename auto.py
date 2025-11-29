@@ -1,6 +1,6 @@
 ##############################################################
 # auto.py — 도로주행 자동 배정 (최종 통합판)
-# 공평성 모델 + 코스/교양/섞임(현재 교시 반영) 가중치 + 랜덤 3일 제외 + pairing
+# 공평성 모델 + 코스/교양/섞임(최후순위) 가중치 + 랜덤 3일 제외 + pairing
 ##############################################################
 
 import streamlit as st
@@ -85,7 +85,7 @@ class Staff:
 
         self.load = 0
         self.course_penalty_next = False 
-        self.is_mixed_today = False # 현재 교시 종별 섞임 여부 (가중치 계산용)
+        self.is_mixed_today = False 
 
 ##############################################################
 # 랜덤 히스토리 (규칙 10)
@@ -140,7 +140,7 @@ def eligible(st, typecode):
 ##############################################################
 def apply_weights(staff, period):
     """
-    Load에 현재 교시의 코스/교양 가중치를 누적합니다. (종별 섞임 제외)
+    Load에 현재 교시의 코스/교양 가중치를 누적합니다.
     """
     for i, s in enumerate(staff):
         w = 0
@@ -235,7 +235,7 @@ def assign_period(staff, period, demand, is_morning):
         if target_assignment[i] > base_cap:
              target_assignment[i] = base_cap
     
-    # 6. 실제 배정 (목표 횟수까지)
+    # 6. 실제 배정 (목표 횟수까지) - 종별 섞임을 최후로 미루는 로직 추가
     order = [
         ("1M", demand.get("1M",0)),
         ("1A", demand.get("1A",0)),
@@ -245,42 +245,74 @@ def assign_period(staff, period, demand, is_morning):
 
     assigned_count = [0] * n 
     
-    # 1차 배정: 목표 횟수까지
+    # 1차 배정: 목표 횟수까지 채우기
     for typ, need in order:
         current_need = need
         
+        # Load 낮은 순서로 감독관 리스트 순회
         for i in staff_indices_sorted:
             if current_need == 0:
                 break
 
             s = staff[i]
             
-            if eligible(s, typ) and assigned_count[i] < target_assignment[i] and total[i] < base_cap:
+            # 배정 가능 기본 조건
+            if not eligible(s, typ) or assigned_count[i] >= target_assignment[i] or total[i] >= base_cap:
+                continue
+
+            # **종별 섞임 최후 순위 로직**:
+            # 이미 다른 종별을 배정받았다면 (즉, 현재 배정하면 섞임이 발생하는 경우),
+            # Load가 낮은 동점 후보들 중 섞이지 않는 후보가 있다면 그 후보에게 우선권을 주기 위해 이 단계에서는 건너뜁니다.
+            
+            # 1. 현재 배정하면 섞임이 발생하는지 체크
+            is_mixing = (total[i] > 0 and assigned[i].get(typ, 0) == 0)
+
+            if is_mixing:
+                # 2. 동점자 중 섞이지 않는 후보가 있는지 확인 (Load, Target Assignment, Cap이 모두 같은 후보)
                 
-                # 배정
-                assigned[i][typ] += 1
-                total[i] += 1
-                assigned_count[i] += 1
-                current_need -= 1
+                # 현재 감독관과 동일한 우선순위(Load, Target, Cap)를 가진 모든 감독관 리스트
+                current_load = s.load
+                current_target = target_assignment[i]
+                
+                # 동점자 그룹 (Load와 Target Assignment가 같고, 배정 가능하며, Cap 미만인 후보)
+                same_rank_eligible = [
+                    idx for idx in staff_indices_sorted 
+                    if staff[idx].load == current_load 
+                    and target_assignment[idx] == current_target
+                    and eligible(staff[idx], typ)
+                    and assigned_count[idx] < current_target
+                    and total[idx] < base_cap
+                ]
+                
+                # 동점자 그룹 내에서 섞이지 않는(단일 종별인) 후보가 있는지 확인
+                non_mixing_exists = any(
+                    total[idx] == 0 for idx in same_rank_eligible 
+                )
+
+                if non_mixing_exists:
+                    # 섞이지 않는 후보가 있다면, 현재 섞이는 후보는 건너뛰고 다음 기회에 배정
+                    continue 
+
+            # 배정 (섞이는 후보는 동점 그룹 내에 non-mixing 후보가 없을 때만 배정됨)
+            assigned[i][typ] += 1
+            total[i] += 1
+            assigned_count[i] += 1
+            current_need -= 1
     
     # 7. 잔여 수요 재배정 (최소 Load & max cap 미만에게)
-    # 종별 섞임 가중치(1)가 현재 교시 배정에 반영되어야 하므로,
-    # 배정이 추가될 때마다 is_mixed_today를 확인하여 Load를 동적으로 조정하며 재배정합니다.
+    # 1차 배정 후 남은 잔여 수요를 재배정합니다. 이 단계에서는 종별 섞임 패널티(1)를 동적으로 적용하여 배정합니다.
     
     for typ, _ in order:
         while demand.get(typ, 0) > sum(a[typ] for a in assigned):
             
-            # 현재 시점의 Load 계산: 기존 Load + 종별 섞임 가중치
+            # 현재 시점의 Load 계산: 기본 Load + 종별 섞임 가중치(현재 교시 반영)
             current_loads = []
             for i, s in enumerate(staff):
                 mix_count_now = sum(1 for t, count in assigned[i].items() if count > 0)
                 # 현재 배정 시 섞이게 될 경우를 예측하여 Load에 반영
+                # 이미 1종 배정을 받았는데, 2종을 받으려고 하는 경우 mix_count_now가 1이 됨
                 mix_penalty = 1 if mix_count_now >= 1 and assigned[i].get(typ, 0) == 0 else 0
                 
-                # 섞임 패널티는 한 번만 적용되도록 is_mixed_today를 사용 (옵션)
-                # 여기서는 동적으로 계산하기 위해 mix_penalty만 사용
-                
-                # **핵심**: Load = 기본 Load + 현재 교시 종별 섞임 패널티
                 current_loads.append(float(s.load) + mix_penalty)
 
             
@@ -300,13 +332,12 @@ def assign_period(staff, period, demand, is_morning):
             if min_load is None:
                 break
                 
-            # 최소 Load 동점자 리스트
             idx_list = [
                 i for i in eligible_indices
                 if abs(current_loads[i] - min_load) < 1e-9
             ]
             
-            # 더 낮은 Load를 가진 사람이 모두 cap을 채웠을 경우를 고려하여 min_load를 갱신
+            # Load 갱신 로직 (잔여 수요가 많은 경우 Load가 높아진 사람도 재배정되어야 함)
             if not idx_list:
                 current_min_load = min_load
                 next_min_load = None
@@ -343,13 +374,11 @@ def assign_period(staff, period, demand, is_morning):
 
     # 8. 다음 교시를 위한 Load 누적 및 코스 연장 가중치 설정
     for i,s in enumerate(staff):
-        # 1. 종별 섞임 가중치 추가 (다음 교시 Load에 적용되는 종별 섞임 가중치는 이제 없습니다.
-        #    대신, 현재 교시에서 섞임이 발생했다는 표시만 남깁니다.)
+        # 1. 최종 종별 섞임 여부 기록
         mix_count_final = sum(1 for v in assigned[i].values() if v > 0)
         s.is_mixed_today = (mix_count_final > 1)
 
-        # 2. Load 초기화 후 현재 교시의 배정수 누적
-        # (현재 교시 가중치는 이미 배정에 사용되었으므로 제거하고, 누적 배정수만 남깁니다.)
+        # 2. Load 초기화 후 현재 교시의 배정수 누적 (다음 교시 Load에 반영)
         s.load = float(total[i]) 
         
         # 3. 코스 연장 가중치 설정 (1교시 → 2교시)
@@ -395,6 +424,7 @@ def pair_results(staff, total):
 
     return pairs
 
+# (이하 STREAMLIT UI 코드는 변경 없이 그대로 유지됩니다.)
 ##############################################################
 # STREAMLIT UI (UI는 기존 코드를 유지하며, 로직 호출만 수정)
 ##############################################################
@@ -402,9 +432,8 @@ st.title("🚗 도로주행 자동 배정 (최종 공평성 모델)")
 
 tab_m, tab_a, tab_r = st.tabs(["🌅 오전 배정", "🌇 오후 배정", "🎲 랜덤결과"])
 
-##############################################################
-# 오전 탭
-##############################################################
+# ... (오전 탭) ...
+
 with tab_m:
     st.subheader("📥 오전 텍스트 입력")
 
