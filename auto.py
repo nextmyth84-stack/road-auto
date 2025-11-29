@@ -1,6 +1,6 @@
 ##############################################################
-# auto.py — 도로주행 자동 배정 (최종 통합판 - 종별 섞임 최후 순위)
-# 공평성 모델 + 코스/교양/섞임(최후순위) 가중치 + 랜덤 3일 제외 + pairing
+# auto.py — 도로주행 자동 배정 (최종 통합판 - 연속 배정 우선)
+# 공평성 모델 + 코스/교양/섞임방지(Stacking) + 랜덤 3일 제외
 ##############################################################
 
 import streamlit as st
@@ -31,7 +31,7 @@ def save_json(path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 ##############################################################
-# 수동 가능자 (규칙 9 유지)
+# 수동 가능자
 ##############################################################
 MANUAL_SET = {
     "권한솔","김남균","김성연",
@@ -43,13 +43,10 @@ MANUAL_SET = {
 ##############################################################
 def parse_staff(text):
     staff = []
-
-    # 1종수동: "1종수동: 7호 김남균"
     m = re.findall(r"1종수동\s*:\s*[\d]+호\s*([가-힣]+)", text)
     for name in m:
         staff.append(name.strip())
 
-    # 2종자동 bullet
     m2 = re.findall(r"•\s*[\d]+호\s*([가-힣]+)", text)
     for name in m2:
         staff.append(name.strip())
@@ -63,7 +60,6 @@ def parse_extra(text):
     for gyo, nm in m:
         edu[int(gyo)] = nm.strip()
 
-    # 코스점검자
     course = []
     m2 = re.findall(r"코스점검\s*:\s*(.*)", text)
     if m2:
@@ -88,7 +84,7 @@ class Staff:
         self.is_mixed_today = False 
 
 ##############################################################
-# 랜덤 히스토리 (규칙 10)
+# 랜덤 히스토리
 ##############################################################
 def load_history():
     return load_json(HISTORY_FILE, [])
@@ -96,7 +92,6 @@ def load_history():
 def save_history(hist):
     save_json(HISTORY_FILE, hist)
 
-# 최근 3일 동안 랜덤 당첨된 적이 있는지 체크 (규칙 10)
 def used_recently(hist, name):
     today = date.today()
     for h in hist:
@@ -105,7 +100,6 @@ def used_recently(hist, name):
             return True
     return False
 
-# 랜덤 당첨 기록 (규칙 10)
 def record_random(hist, name, period):
     hist.append({
         "date": date.today().isoformat(),
@@ -115,12 +109,10 @@ def record_random(hist, name, period):
     })
 
 def check_history_full(hist, staff_names):
-    """히스토리가 전체 인원을 다 포함하면 True 반환 (규칙 10)"""
     recent_names = {h["name"] for h in hist if h.get("type") == "random_pick"}
     return recent_names.issuperset(set(staff_names))
 
 def clear_history_if_full(hist, staff_names):
-    """히스토리가 전체 인원을 다 포함하면 초기화 (규칙 10)"""
     if check_history_full(hist, staff_names):
         st.warning("🚨 **랜덤 히스토리 초기화**: 전체 인원이 한 번씩 랜덤 배정되어 기록을 초기화합니다.")
         hist.clear()
@@ -128,7 +120,7 @@ def clear_history_if_full(hist, staff_names):
     return False
 
 ##############################################################
-# 자격 체크 (규칙 9 유지)
+# 자격 체크
 ##############################################################
 def eligible(st, typecode):
     if st.is_manual:
@@ -136,23 +128,15 @@ def eligible(st, typecode):
     return typecode in ("1A", "2A")
 
 ##############################################################
-# 가중치 적용 (코스/교양 가중치 - 배정 시작 전 Load에 반영)
+# 가중치 적용
 ##############################################################
 def apply_weights(staff, period):
-    """
-    Load에 현재 교시의 코스/교양 가중치를 누적합니다.
-    """
     for i, s in enumerate(staff):
         w = 0
-
-        # 1. 코스 담당자 가중치 (1교시 적용, 2교시 연장)
         if s.is_course:
-            if period == 1:
-                w += 1
-            elif period == 2 and s.course_penalty_next:
-                w += 1
+            if period == 1: w += 1
+            elif period == 2 and s.course_penalty_next: w += 1
 
-        # 2. 다음 교시 교양 담당자 가중치
         target_edu_period = None
         if period == 1: target_edu_period = 2
         elif period == 3: target_edu_period = 4
@@ -161,81 +145,61 @@ def apply_weights(staff, period):
         if target_edu_period and s.is_edu.get(target_edu_period):
             w += 1
 
-        # 가중치 중복 최대 1 (규칙 7)
-        if w > 1:
-            w = 1
-
-        # Load에 가중치 누적 (규칙 5, 6)
+        if w > 1: w = 1
         s.load = float(s.load) + w
 
 ##############################################################
-# 랜덤 선택 (최근 3일 제외) (규칙 10)
+# 랜덤 선택
 ##############################################################
 def pick_random_candidate(staff, idx_list, period, hist):
-    """
-    동점자 중 랜덤 선정. 최근 3일 랜덤 당첨자는 제외 후 선택.
-    """
     filtered = [i for i in idx_list if not used_recently(hist, staff[i].name)]
-    
     if filtered:
         pick = random.choice(filtered)
     else:
         pick = random.choice(idx_list)
-        
     record_random(hist, staff[pick].name, period)
     return pick
 
 ##############################################################
-# 한 교시 배정
+# 한 교시 배정 (핵심 로직 수정)
 ##############################################################
 def assign_period(staff, period, demand, is_morning):
 
-    # 교시별 최대 배정 인원 수 (규칙 2)
     BASE_CAP_MAP = {1: 2, 2: 3, 3: 3, 4: 3, 5: 2}
     base_cap = BASE_CAP_MAP.get(period, 3)
 
     n = len(staff)
     staff_names = [s.name for s in staff]
     
-    # 1. 랜덤 히스토리 로드 및 초기화 체크
     hist = load_history()
     clear_history_if_full(hist, staff_names)
     
-    # 2. Load 초기화 및 코스 연장/섞임 여부 초기화
     if period != 2:
-        for s in staff:
-            s.course_penalty_next = False
-    for s in staff:
-        s.is_mixed_today = False
+        for s in staff: s.course_penalty_next = False
+    for s in staff: s.is_mixed_today = False
     
-    # 3. 현재 교시의 코스/교양 가중치 적용 (Load 누적 포함)
     apply_weights(staff, period)
     
-    # 4. 배정 결과 딕셔너리 및 총 배정 수
-    assigned = [
-        {"1M":0,"1A":0,"2A":0,"2M":0}
-        for _ in range(n)
-    ]
+    assigned = [{"1M":0,"1A":0,"2A":0,"2M":0} for _ in range(n)]
     total = [0]*n
     
-    # 5. 총 수요 및 목표 횟수 계산 (규칙 1, 6)
+    # 목표 배정 횟수 설정
     total_demand = sum(demand.values())
     target_base = total_demand // n
     target_rem = total_demand % n
     
-    # Load가 낮은 순서 (우선순위가 높은 순서)
+    # Load 낮은 순으로 target +1 부여
     staff_indices_sorted = sorted(range(n), key=lambda i: staff[i].load)
-    
     target_assignment = [target_base] * n
-    
     for i in staff_indices_sorted[:target_rem]:
         target_assignment[i] += 1
     
+    # Cap 적용
     for i in range(n):
         if target_assignment[i] > base_cap:
              target_assignment[i] = base_cap
     
-    # 6. 실제 배정 (목표 횟수까지) - 종별 섞임을 최후로 미루는 로직 강화
+    # 배정 순서
     order = [
         ("1M", demand.get("1M",0)),
         ("1A", demand.get("1A",0)),
@@ -245,16 +209,13 @@ def assign_period(staff, period, demand, is_morning):
 
     assigned_count = [0] * n 
     
-    # 1차 배정: 목표 횟수까지 채우기
+    # ---------------------------------------------------------
+    # 1차 배정: 목표 횟수(target_assignment) 채우기
+    # ---------------------------------------------------------
     for typ, need in order:
         current_need = need
         
-        # **종별 섞임 회피를 위한 정렬 기준**:
-        # 1. Load (기존 코스/교양 가중치 및 이전 교시 배정수 포함)
-        # 2. 현재까지 배정된 종별 수 (0인 사람이 1인 사람보다 우선)
-        # 3. 현재까지 배정된 총 횟수
-        
-        # 현재 수요 type에 배정 가능한 감독관을 기준으로 정렬 리스트 생성
+        # 해당 종별(typ)을 받을 수 있는 후보군 필터링
         eligible_for_typ = [
             i for i, s in enumerate(staff) 
             if eligible(s, typ) 
@@ -262,130 +223,100 @@ def assign_period(staff, period, demand, is_morning):
             and total[i] < base_cap
         ]
         
+        # ⭐ 정렬 기준 수정 (여기가 핵심) ⭐
         def sort_key(i):
-            # 1. Load: 낮을수록 우선
-            # 2. 종별 수: 현재 배정된 종별의 수 (적을수록 우선, 0이면 1인 사람보다 우선)
-            #    *assigned[i].get(t, 0) == 0* : 아직 이 종별을 배정받지 않았을 경우
-            #    *total[i] > 0* : 다른 종별을 이미 배정받았을 경우
-            is_mixing = total[i] > 0 and assigned[i].get(typ, 0) == 0
+            # 1. 섞임 발생 여부 (가장 중요: 0이 좋음)
+            #    (총 배정이 있는데, 이 종별은 없다면 섞이는 것)
+            is_mixing = 1 if (total[i] > 0 and assigned[i].get(typ, 0) == 0) else 0
             
-            # 종별 섞임이 발생하면 1, 아니면 0 (적을수록 좋음)
-            mix_cost = 1 if is_mixing else 0
+            # 2. 연속 배정(Stacking) 우선 (Empty보다 우선)
+            #    이미 이 종별을 1개 이상 가지고 있다면 -> 우선순위 높음 (-1)
+            #    아무것도 안 가진 사람(Empty) -> 보통 (0)
+            #    (오름차순 정렬이므로 작은 값이 먼저 옴)
+            has_type_priority = -1 if assigned[i].get(typ, 0) > 0 else 0
             
-            # 3. 총 배정 횟수: 적을수록 우선
-            return (staff[i].load, mix_cost, total[i])
+            # 3. Load (Fairness)
+            return (is_mixing, has_type_priority, staff[i].load)
 
-
-        # 1차 목표 배정을 위한 정렬 (Load > 섞임 비용 > 총 배정 횟수)
+        # 정렬 수행
         sorted_indices = sorted(eligible_for_typ, key=sort_key)
         
+        # 배정
         for i in sorted_indices:
             if current_need == 0:
                 break
-
-            # 배정
+            
             assigned[i][typ] += 1
             total[i] += 1
             assigned_count[i] += 1
             current_need -= 1
     
-    # 7. 잔여 수요 재배정 (최소 Load & max cap 미만에게)
-    # 이 단계에서는 종별 섞임에 대한 패널티를 Load에 합산하여 순위를 정합니다.
-    
+    # ---------------------------------------------------------
+    # 2차 배정: 잔여 수요 재배정 (목표 횟수 이상 배정해야 할 때)
+    # ---------------------------------------------------------
     for typ, _ in order:
         while demand.get(typ, 0) > sum(a[typ] for a in assigned):
             
-            # 현재 시점의 Load 계산: 기본 Load + 종별 섞임 가중치(현재 교시 반영)
+            # 현재 시점의 Load 계산 (섞임 패널티 포함)
             current_loads = []
             for i, s in enumerate(staff):
-                # 이 배정을 통해 종별 섞임이 발생하는지 확인 (잔여 수요 단계에서는 섞임에 대한 패널티 적용)
                 is_mixing = total[i] > 0 and assigned[i].get(typ, 0) == 0
                 mix_penalty = 1 if is_mixing else 0
-                
-                # Load = 기본 Load + 현재 교시 종별 섞임 패널티
                 current_loads.append(float(s.load) + mix_penalty)
-
             
-            min_load = None
+            min_val = None
             eligible_indices = [
                 i for i, s in enumerate(staff)
                 if eligible(s, typ) and total[i] < base_cap
             ]
             
-            if not eligible_indices:
-                break
+            if not eligible_indices: break
 
+            # 최소 Load 찾기
             for i in eligible_indices:
-                if min_load is None or current_loads[i] < min_load:
-                    min_load = current_loads[i]
+                if min_val is None or current_loads[i] < min_val:
+                    min_val = current_loads[i]
 
-            if min_load is None:
-                break
+            if min_val is None: break
                 
+            # 동점자 그룹
             idx_list = [
                 i for i in eligible_indices
-                if abs(current_loads[i] - min_load) < 1e-9
+                if abs(current_loads[i] - min_val) < 1e-9
             ]
             
-            # Load 갱신 로직 (더 높은 Load를 가진 사람도 재배정되어야 할 때)
+            # 만약 최소 Load인 사람들이 모두 꽉 찼다면 다음 순위 찾기
             if not idx_list:
-                current_min_load = min_load
-                next_min_load = None
-                
-                for i in eligible_indices:
-                    if current_loads[i] > current_min_load:
-                        if next_min_load is None or current_loads[i] < next_min_load:
-                            next_min_load = current_loads[i]
-                            
-                if next_min_load is None:
-                    break
-                
-                min_load = next_min_load
-                
-                idx_list = [
-                    i for i in eligible_indices
-                    if abs(current_loads[i] - min_load) < 1e-9
-                ]
-
-                if not idx_list:
-                    break
+                # (생략 가능하지만 안전장치)
+                break 
             
-            # (3) 랜덤 선정 (규칙 10)
+            # 랜덤 선정
             if len(idx_list) == 1:
                 pick = idx_list[0]
             else:
                 pick = pick_random_candidate(staff, idx_list, period, hist)
 
-            # 배정
             assigned[pick][typ] += 1
             total[pick] += 1
             assigned_count[pick] += 1
 
-
-    # 8. 다음 교시를 위한 Load 누적 및 코스 연장 가중치 설정
+    # Load 누적 및 코스 연장 설정
     for i,s in enumerate(staff):
-        # 1. 최종 종별 섞임 여부 기록
         mix_count_final = sum(1 for v in assigned[i].values() if v > 0)
         s.is_mixed_today = (mix_count_final > 1)
 
-        # 2. Load 초기화 후 현재 교시의 배정수 누적 (다음 교시 Load에 반영)
         s.load = float(total[i]) 
         
-        # 3. 코스 연장 가중치 설정 (1교시 → 2교시)
         if period == 1 and s.is_course:
             s.course_penalty_next = (total[i] == 0)
 
-    # 9. 히스토리 저장
     save_history(hist)
     return assigned, total
 
 ##############################################################
-# 배정 결과 pairing 표시 (규칙 11)
+# 배정 결과 pairing
 ##############################################################
 def pair_results(staff, total):
-    """
-    배정 1 또는 0일 때 짝지어 표시 (규칙 11)
-    """
     ones = []
     zeros = []
     for i,s in enumerate(staff):
@@ -395,26 +326,24 @@ def pair_results(staff, total):
             zeros.append(s.name)
 
     pairs = []
-    
-    # 1명끼리 pairing
     for i in range(0, len(ones), 2):
         if i+1 < len(ones):
             pairs.append(f"{ones[i]} - {ones[i+1]}")
         else:
-            # 홀수 1명 발생 → 0명과 pairing
             if zeros:
                 z = zeros.pop(0)
                 pairs.append(f"{ones[i]} - {z}(참관)")
             else:
                 pairs.append(f"{ones[i]} - (단독)")
 
-    # 남은 0명은 모두 참관으로 표시
     for z in zeros:
         pairs.append(f"{z}(참관)")
 
     return pairs
 
-# (이하 STREAMLIT UI 코드는 변경 없이 그대로 유지됩니다.)
+##############################################################
+# STREAMLIT UI
+##############################################################
 st.title("🚗 도로주행 자동 배정 (최종 공평성 모델)")
 
 tab_m, tab_a, tab_r = st.tabs(["🌅 오전 배정", "🌇 오후 배정", "🎲 랜덤결과"])
