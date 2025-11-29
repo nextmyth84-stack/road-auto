@@ -186,7 +186,7 @@ def assign_period(staff, period, demand, is_morning):
     apply_weights(staff, period)
 
     assigned = [{"1M":0,"1A":0,"2A":0,"2M":0} for _ in range(n)]
-    total = *n
+    total = [0] * n
 
     total_demand = sum(demand.values())
     if n == 0:
