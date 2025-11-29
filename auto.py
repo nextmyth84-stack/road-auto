@@ -211,7 +211,8 @@ def assign_period(staff, period, demand, is_morning):
         ("2M", demand.get("2M",0)),
     ]
 
-    assigned_count =  * n
+    assigned_count = [0] * n
+
 
     # 1차 배정: 목표 횟수 채우기 (종별 섞임 최소화 + 같은 종 우선 몰아주기)
     for typ, need in order:
