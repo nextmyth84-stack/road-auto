@@ -381,8 +381,7 @@ with tab_m:
 
             st.subheader("Pairing 결과")
             pairs = pair_results(staff_list, total)
-            st.write("
-".join(pairs) if pairs else "pairing 없음")
+            st.write(" ".join(pairs) if pairs else "pairing 없음")
 
 with tab_a:
     st.subheader("오후 텍스트 입력")
