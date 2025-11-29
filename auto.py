@@ -1,5 +1,5 @@
 ##############################################################
-# auto.py — 도로주행 자동 배정 (최종 수정: Key Label 충돌 해결)
+# auto.py — 도로주행 자동 배정 (최종 수정: data_editor 옵션 수정)
 ##############################################################
 
 import streamlit as st
@@ -255,7 +255,8 @@ with tab1:
 
     st.subheader("근무자 및 담당 확인")
     m_df = pd.DataFrame({"이름": st.session_state["m_staff"]})
-    edited_m = st.data_editor(m_df, num_rows="dynamic", heading_fixed=True, key="editor_m")
+    # [수정] heading_fixed=True 제거
+    edited_m = st.data_editor(m_df, num_rows="dynamic", key="editor_m")
     final_m_staff = edited_m["이름"].dropna().unique().tolist()
     
     col_c, col_e = st.columns(2)
@@ -268,7 +269,6 @@ with tab1:
         if edu_cand in final_m_staff:
             def_idx = final_m_staff.index(edu_cand) + 1
         
-        # [수정됨] Key에 period_m 추가하여 충돌 방지
         m_edu_real = st.selectbox(
             f"{target_edu_p}교시 교양 담당자 (가중치 대상)", 
             ["없음"] + final_m_staff, 
@@ -332,7 +332,8 @@ with tab2:
 
     st.subheader("근무자 및 담당 확인")
     a_df = pd.DataFrame({"이름": st.session_state["a_staff"]})
-    edited_a = st.data_editor(a_df, num_rows="dynamic", heading_fixed=True, key="editor_a")
+    # [수정] heading_fixed=True 제거
+    edited_a = st.data_editor(a_df, num_rows="dynamic", key="editor_a")
     final_a_staff = edited_a["이름"].dropna().unique().tolist()
     
     col_c2, col_e2 = st.columns(2)
@@ -348,7 +349,6 @@ with tab2:
         if edu_cand_a in final_a_staff:
             def_idx_a = final_a_staff.index(edu_cand_a) + 1
             
-        # [수정됨] Key에 period_a 추가하여 충돌 해결 (핵심 수정 부분)
         a_edu_real = st.selectbox(
             f"{target_edu_p_a}교시 교양 담당자 (가중치 대상)", 
             ["없음"] + final_a_staff, 
