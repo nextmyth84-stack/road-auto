@@ -452,7 +452,7 @@ with tab_a:
 
         st.subheader("🛠 교양 수정 (다음 교시 적용)")
         edu_sel = {}
-        for k in [4,5]
+        for k in [4,5] :
             edu_nm = st.session_state["a_edu"].get(k)
             default_index = 0
             if edu_nm in final_a:
