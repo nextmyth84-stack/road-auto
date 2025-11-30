@@ -1,10 +1,5 @@
 ##############################################################
-# auto.py — 도로주행 자동 배정 (Quota+타입 2단계 최적화 버전)
-# - 교시별 cap(1:2,2:3,3:3,4:3,5:2)
-# - 배정 수 차이 최대 1 (가능한 범위에서 강제)
-# - 코스/다음 교시 교양 가중치
-# - 종별 섞임(특히 수동/자동 혼합) 최소화
-# - 랜덤 히스토리 (최근 3일 min_load)
+# auto.py — 도로주행 자동 배정 (Quota+타입 2단계 + 1M 몰아주기 + 가중치 랜덤제외)
 ##############################################################
 
 import streamlit as st
@@ -38,8 +33,8 @@ def save_json(path, data):
 # 수동 가능자 세팅
 ##############################################################
 MANUAL_SET = {
-    "권한솔","김남균","김성연",
-    "김주현","이호석","조정래"
+    "권한솔", "김남균", "김성연",
+    "김주현", "이호석", "조정래"
 }
 
 ##############################################################
@@ -50,11 +45,9 @@ def parse_staff(text):
     # 1종수동 : 00호 홍길동
     m = re.findall(r"1종수동\s*:\s*[\d]+호\s*([가-힣]+)", text)
     staff.extend([x.strip() for x in m])
-
     # • 00호 홍길동
     m2 = re.findall(r"•\s*[\d]+호\s*([가-힣]+)", text)
     staff.extend([x.strip() for x in m2])
-
     # 중복 제거
     return list(dict.fromkeys(staff))
 
@@ -82,11 +75,10 @@ class Staff:
     def __init__(self, name):
         self.name = name
         self.is_manual = (name in MANUAL_SET)
-
         # 배정 정보
-        self.assigned_counts = {"1M":0, "1A":0, "2A":0, "2M":0}
-        self.total_assigned = 0  # 이번 교시 내 총 배정수
-        self.weight_val = 0      # 코스/다음 교시 교양 가중치 (0 또는 1)
+        self.assigned_counts = {"1M": 0, "1A": 0, "2A": 0, "2M": 0}
+        self.total_assigned = 0   # 이번 교시 내 총 배정수
+        self.weight_val = 0       # 코스/다음 교시 교양 가중치 (0 또는 1)
 
 ##############################################################
 # 히스토리 관리 (최근 3일, min_load 기록)
@@ -137,7 +129,7 @@ def get_transmission_type(typecode):
 ##############################################################
 # 1단계: quota 계산 (공평성 + cap)
 ##############################################################
-CAP_MAP = {1:2, 2:3, 3:3, 4:3, 5:2}
+CAP_MAP = {1: 2, 2: 3, 3: 3, 4: 3, 5: 2}
 
 def compute_quota(staff_objs, period, total_demand, hist):
     """
@@ -183,13 +175,16 @@ def assign_types_within_quota(staff_objs, period, quotas, demand):
     """
     이미 정해진 quota 안에서 종별/섞임/자격/가중치를 고려해 타입 배정.
     - quota[i] 개수 이내에서만 배정 → 공평성 유지
+    - 1M는 가능한 한 한 사람(또는 소수)에게 몰아주는 방향
     """
     type_order = ["1M", "1A", "2A", "2M"]
     remaining_quota = quotas[:]
     total_before = sum(demand.values())
 
-    def type_score(staff, tcode):
-        # 1) 섞임 페널티
+    def general_type_score(staff, tcode):
+        """
+        1M 전용 로직 외의 타입(1A,2A,2M)에 대한 기본 점수.
+        """
         current_types = [k for k, v in staff.assigned_counts.items() if v > 0]
         mix_penalty = 0
         new_tr = get_transmission_type(tcode)
@@ -197,19 +192,17 @@ def assign_types_within_quota(staff_objs, period, quotas, demand):
         if current_types:
             existing_trs = {get_transmission_type(ct) for ct in current_types}
             if tcode in current_types:
-                mix_penalty = 0         # 같은 종별
+                mix_penalty = 0
             else:
                 if new_tr in existing_trs:
-                    mix_penalty = 1     # 같은 변속기 다른 종 (허용)
+                    mix_penalty = 1   # 같은 변속기 다른 종
                 else:
-                    mix_penalty = 10    # Manual vs Auto 혼합 (최대한 회피)
+                    mix_penalty = 10  # Manual vs Auto 혼합
 
-        # 2) 남은 수요가 큰 타입 우선 (tail 줄이기) → 음수로(적을수록 좋음)
+        # 남은 수요가 큰 타입 우선 (tail 줄이기)
         demand_penalty = -demand[tcode]
-
-        # 3) 가중치(코스/교양)는 동점 시 일반인 먼저 뽑도록 마지막에 둠
+        # 가중치는 동점 시 일반인 먼저
         weight_penalty = staff.weight_val
-
         return (mix_penalty, demand_penalty, weight_penalty)
 
     while True:
@@ -227,9 +220,39 @@ def assign_types_within_quota(staff_objs, period, quotas, demand):
             if not candidates:
                 continue
 
-            best_t = min(candidates, key=lambda t: type_score(s, t))
+            # 1M 수요가 남아있으면, 먼저 1M 몰아주기 로직 적용
+            if "1M" in candidates and demand.get("1M", 0) > 0:
+                manual_indices = [
+                    j for j, sj in enumerate(staff_objs)
+                    if remaining_quota[j] > 0 and sj.is_manual
+                ]
+                if manual_indices:
+                    # 아직 1M가 없는 사람 우선
+                    zero_1m = [
+                        j for j in manual_indices
+                        if staff_objs[j].assigned_counts.get("1M", 0) == 0
+                    ]
+                    target_group = zero_1m if zero_1m else manual_indices
 
-            # 배정 실행
+                    # 1M 적을수록, 2A 적을수록, 가중치 적을수록 우선
+                    def score_1m(j):
+                        sj = staff_objs[j]
+                        cnt_1m = sj.assigned_counts.get("1M", 0)
+                        cnt_2a = sj.assigned_counts.get("2A", 0)
+                        return (cnt_1m, cnt_2a, sj.weight_val)
+
+                    best_idx = min(target_group, key=score_1m)
+
+                    staff_objs[best_idx].assigned_counts["1M"] += 1
+                    staff_objs[best_idx].total_assigned += 1
+                    remaining_quota[best_idx] -= 1
+                    demand["1M"] -= 1
+                    progress = True
+                    continue  # 다음 사람으로
+
+            # 나머지 타입(1A/2A/2M)은 일반 점수 사용
+            best_t = min(candidates, key=lambda t: general_type_score(s, t))
+
             s.assigned_counts[best_t] += 1
             s.total_assigned += 1
             remaining_quota[i] -= 1
@@ -258,9 +281,12 @@ def assign_logic(staff_names, period, demand, edu_map, course_list):
     staff_objs = [Staff(nm) for nm in staff_names]
 
     target_edu_period = None
-    if period == 1: target_edu_period = 2
-    elif period == 3: target_edu_period = 4
-    elif period == 4: target_edu_period = 5
+    if period == 1:
+        target_edu_period = 2
+    elif period == 3:
+        target_edu_period = 4
+    elif period == 4:
+        target_edu_period = 5
 
     next_edu_name = edu_map.get(target_edu_period)
 
@@ -270,7 +296,8 @@ def assign_logic(staff_names, period, demand, edu_map, course_list):
             w += 1
         if next_edu_name and s.name == next_edu_name:
             w += 1
-        if w > 1: w = 1
+        if w > 1:
+            w = 1
         s.weight_val = w
 
     total_demand = sum(demand.values())
@@ -291,10 +318,13 @@ def assign_logic(staff_names, period, demand, edu_map, course_list):
     demand_copy = dict(demand)
     staff_objs = assign_types_within_quota(staff_objs, period, quotas, demand_copy)
 
-    # 히스토리 업데이트 (이번 교시에서 가장 적게 배정된 사람들)
+    # 히스토리 업데이트 (가중치 받은 사람은 제외)
     if staff_objs:
         min_assigned = min(s.total_assigned for s in staff_objs)
-        lucky_people = [s.name for s in staff_objs if s.total_assigned == min_assigned]
+        lucky_people = [
+            s.name for s in staff_objs
+            if s.total_assigned == min_assigned and s.weight_val == 0
+        ]
         today_str = date.today().isoformat()
         for name in lucky_people:
             hist.append({"date": today_str, "name": name, "type": "min_load"})
@@ -336,12 +366,18 @@ def make_pairing_text(staff_objs):
 ##############################################################
 tab1, tab2, tab3 = st.tabs(["🌅 오전 배정", "🌇 오후 배정", "🎲 데이터 관리"])
 
-if "m_staff" not in st.session_state: st.session_state["m_staff"] = []
-if "a_staff" not in st.session_state: st.session_state["a_staff"] = []
-if "m_edu" not in st.session_state: st.session_state["m_edu"] = {}
-if "a_edu" not in st.session_state: st.session_state["a_edu"] = {}
-if "m_course" not in st.session_state: st.session_state["m_course"] = []
-if "a_course" not in st.session_state: st.session_state["a_course"] = []
+if "m_staff" not in st.session_state:
+    st.session_state["m_staff"] = []
+if "a_staff" not in st.session_state:
+    st.session_state["a_staff"] = []
+if "m_edu" not in st.session_state:
+    st.session_state["m_edu"] = {}
+if "a_edu" not in st.session_state:
+    st.session_state["a_edu"] = {}
+if "m_course" not in st.session_state:
+    st.session_state["m_course"] = []
+if "a_course" not in st.session_state:
+    st.session_state["a_course"] = []
 
 ##############################################################
 # 오전 탭
@@ -458,8 +494,10 @@ with tab2:
         )
     with col_e2:
         target_edu_p_a = 0
-        if period_a == 3: target_edu_p_a = 4
-        elif period_a == 4: target_edu_p_a = 5
+        if period_a == 3:
+            target_edu_p_a = 4
+        elif period_a == 4:
+            target_edu_p_a = 5
 
         def_idx_a = 0
         edu_cand_a = st.session_state["a_edu"].get(target_edu_p_a)
